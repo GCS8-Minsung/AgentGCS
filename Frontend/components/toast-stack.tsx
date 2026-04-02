@@ -55,10 +55,14 @@ export function ToastStack({ events }: Props) {
       {toasts.map((toast) => (
         <div
           key={toast.id}
-          className="rounded-xl border border-surface-100 bg-white/95 p-3 shadow-panel backdrop-blur"
+          className="rounded-2xl border border-white/80 bg-white/70 p-3 backdrop-blur-xl"
+          style={{
+            boxShadow:
+              "0 10px 30px rgba(255, 160, 122, 0.12), inset 0 0 12px rgba(255, 255, 255, 0.7)"
+          }}
         >
-          <p className="text-sm font-semibold text-surface-900">{toast.title}</p>
-          <p className="mt-1 text-xs text-surface-800/85">{toast.description}</p>
+          <p className="text-sm font-semibold text-gray-800">{toast.title}</p>
+          <p className="mt-1 text-xs text-orange-900/75">{toast.description}</p>
           {toast.href && (
             <a href={toast.href} target="_blank" rel="noreferrer" className="mt-2 inline-flex">
               <Button size="sm" variant="secondary">
@@ -71,4 +75,3 @@ export function ToastStack({ events }: Props) {
     </div>
   );
 }
-

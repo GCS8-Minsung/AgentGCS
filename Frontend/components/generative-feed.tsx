@@ -18,11 +18,11 @@ function formatPayload(payload: Record<string, unknown>) {
 }
 
 function eventIcon(type: string) {
-  if (type.includes("started")) return <Loader2 className="h-4 w-4 animate-spin text-accent-blue" />;
-  if (type.includes("discovery")) return <Search className="h-4 w-4 text-accent-teal" />;
+  if (type.includes("started")) return <Loader2 className="h-4 w-4 animate-spin text-orange-500" />;
+  if (type.includes("discovery")) return <Search className="h-4 w-4 text-amber-500" />;
   if (type.includes("debate")) return <MessageCircleDashed className="h-4 w-4 text-orange-500" />;
   if (type.includes("failed")) return <TriangleAlert className="h-4 w-4 text-red-600" />;
-  return <Sparkles className="h-4 w-4 text-surface-800" />;
+  return <Sparkles className="h-4 w-4 text-orange-900/70" />;
 }
 
 export function GenerativeFeed({ events, running }: Props) {
@@ -36,29 +36,29 @@ export function GenerativeFeed({ events, running }: Props) {
             스피너, 토스트, 토론 상태를 WebSocket으로 실시간 렌더링합니다.
           </CardDescription>
         </div>
-        {running ? <Badge className="bg-accent-blue/15 text-accent-blue">Running</Badge> : <Badge>Idle</Badge>}
+        {running ? <Badge className="bg-orange-200/60">Running</Badge> : <Badge>Idle</Badge>}
       </div>
-      <div className="max-h-[460px] space-y-2 overflow-y-auto rounded-xl bg-surface-50 p-3">
+      <div className="max-h-[460px] space-y-2 overflow-y-auto rounded-2xl border border-white/60 bg-white/35 p-3">
         {sorted.length === 0 && (
-          <p className="text-sm text-surface-800/70">
+          <p className="text-sm text-gray-600">
             아직 이벤트가 없습니다. 과제를 시작하면 에이전트 대화가 실시간으로 표시됩니다.
           </p>
         )}
         {sorted.map((event, index) => (
           <article
             key={`${event.timestamp ?? "na"}-${index}`}
-            className="rounded-lg border border-surface-100 bg-white p-3"
+            className="rounded-2xl border border-white/70 bg-white/70 p-3"
           >
-            <header className="mb-2 flex items-center gap-2 text-xs text-surface-800/75">
+            <header className="mb-2 flex items-center gap-2 text-xs text-orange-900/70">
               {eventIcon(event.event_type)}
               <span className="font-semibold">{event.event_type}</span>
               {event.timestamp && <span>{new Date(event.timestamp).toLocaleTimeString()}</span>}
             </header>
-            <p className="whitespace-pre-wrap text-sm text-surface-900">
+            <p className="whitespace-pre-wrap text-sm text-gray-800">
               {formatPayload(event.payload)}
             </p>
             {event.event_type === "deep_task.debate_turn" && (
-              <p className="mt-2 text-xs text-surface-800/70">
+              <p className="mt-2 text-xs text-orange-900/70">
                 Persona: {String(event.payload.persona_label ?? "-")} / Score:{" "}
                 {String(event.payload.weight_score ?? "-")}
               </p>
@@ -69,4 +69,3 @@ export function GenerativeFeed({ events, running }: Props) {
     </Card>
   );
 }
-

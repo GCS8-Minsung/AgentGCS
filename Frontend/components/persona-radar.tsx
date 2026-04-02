@@ -104,13 +104,13 @@ export function PersonaRadar({ value, onChange }: Props) {
             startAngle={90}
             endAngle={-270}
           >
-            <PolarGrid stroke="#8cc8cf" strokeOpacity={0.35} />
-            <PolarAngleAxis dataKey="axis" tick={{ fill: "#0f2d34", fontSize: 12 }} />
+            <PolarGrid stroke="#fb923c" strokeOpacity={0.35} />
+            <PolarAngleAxis dataKey="axis" tick={{ fill: "#7c2d12", fontSize: 12 }} />
             <Radar
               dataKey="value"
-              fill="#10b981"
+              fill="#fbbf24"
               fillOpacity={0.35}
-              stroke="#0f766e"
+              stroke="#f97316"
               strokeWidth={2}
             />
           </RadarChart>
@@ -125,7 +125,7 @@ export function PersonaRadar({ value, onChange }: Props) {
         >
           {handlePoints.map((point, index) => (
             <g key={PERSONA_AXES[index].key}>
-              <circle cx={point.x} cy={point.y} r={11} fill="#0f2d34" fillOpacity={0.14} />
+              <circle cx={point.x} cy={point.y} r={11} fill="#7c2d12" fillOpacity={0.12} />
               <circle
                 cx={point.x}
                 cy={point.y}
@@ -146,7 +146,7 @@ export function PersonaRadar({ value, onChange }: Props) {
 
       <div className="grid grid-cols-2 gap-2">
         {PERSONA_AXES.map((axis) => (
-          <label key={axis.key} className="space-y-1 text-xs text-surface-800">
+          <label key={axis.key} className="space-y-1 text-xs text-orange-900/80">
             <span className="font-semibold">{axis.label}</span>
             <Input
               type="number"
@@ -165,10 +165,9 @@ export function PersonaRadar({ value, onChange }: Props) {
         ))}
       </div>
 
-      <pre className="overflow-x-auto rounded-lg bg-surface-900 p-3 text-xs text-surface-100">
+      <pre className="overflow-x-auto rounded-2xl bg-gradient-to-r from-orange-50 to-amber-50 p-3 text-xs text-orange-900">
         {JSON.stringify(value, null, 2)}
       </pre>
     </Card>
   );
 }
-

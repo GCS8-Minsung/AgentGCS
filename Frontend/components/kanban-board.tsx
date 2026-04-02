@@ -100,7 +100,7 @@ export function KanbanBoard({ userId }: Props) {
         {COLUMNS.map((column) => (
           <div
             key={column.key}
-            className="rounded-xl border border-surface-100 bg-surface-50/70 p-3"
+            className="rounded-2xl border border-white/70 bg-white/40 p-3 backdrop-blur-xl"
             onDragOver={(event) => event.preventDefault()}
             onDrop={(event) => {
               event.preventDefault();
@@ -109,8 +109,8 @@ export function KanbanBoard({ userId }: Props) {
             }}
           >
             <header className="mb-3 flex items-center justify-between">
-              <h4 className="font-semibold text-surface-900">{column.label}</h4>
-              <span className="rounded-full bg-white px-2 py-0.5 text-xs font-medium text-surface-800">
+              <h4 className="font-semibold text-gray-800">{column.label}</h4>
+              <span className="rounded-full bg-white/80 px-2 py-0.5 text-xs font-medium text-orange-900/85">
                 {grouped[column.key].length}
               </span>
             </header>
@@ -122,14 +122,18 @@ export function KanbanBoard({ userId }: Props) {
                   onDragStart={(event) => {
                     event.dataTransfer.setData("text/task-id", task.id);
                   }}
-                  className="cursor-grab rounded-lg border border-surface-100 bg-white p-3 text-sm shadow-sm"
+                  className="cursor-grab rounded-2xl border border-white/70 bg-white p-3 text-sm shadow-sm"
+                  style={{
+                    borderColor: "rgba(255,255,255,0.8)",
+                    background: "rgba(255,255,255,0.78)"
+                  }}
                 >
                   <div className="mb-2 flex items-center justify-between">
-                    <p className="font-medium text-surface-900">{task.title}</p>
-                    <GripVertical className="h-4 w-4 text-surface-800/40" />
+                    <p className="font-medium text-gray-800">{task.title}</p>
+                    <GripVertical className="h-4 w-4 text-orange-900/35" />
                   </div>
                   {task.due_date && (
-                    <p className="flex items-center gap-1 text-xs text-surface-800/75">
+                    <p className="flex items-center gap-1 text-xs text-orange-900/70">
                       <CalendarClock className="h-3.5 w-3.5" />
                       {new Date(task.due_date).toLocaleDateString()}
                     </p>
@@ -137,7 +141,7 @@ export function KanbanBoard({ userId }: Props) {
                 </article>
               ))}
               {grouped[column.key].length === 0 && (
-                <p className="rounded-lg border border-dashed border-surface-100 p-3 text-xs text-surface-800/60">
+                <p className="rounded-lg border border-dashed border-white/70 p-3 text-xs text-orange-900/60">
                   이 컬럼에는 아직 작업이 없습니다.
                 </p>
               )}
@@ -148,4 +152,3 @@ export function KanbanBoard({ userId }: Props) {
     </Card>
   );
 }
-
