@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.claude_service import ClaudeService
+from app.services.school_api_client import SchoolApiError, get_school_client_for_user
 from app.services.websocket_manager import WebSocketManager
 
 
@@ -32,6 +33,51 @@ class PersonalAgentService:
             },
         )
         return {"status": "ok", "plan": plan}
+
+    async def execute_school_action(
+        self,
+        *,
+        user_id: str,
+        action: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Minimal action bridge to school API.
+        Supported actions:
+        - list_meeting_rooms
+        - create_meeting_reservation
+        """
+        client = await get_school_client_for_user(user_id)
+        try:
+            if action == "list_meeting_rooms":
+                rooms = await client.list_meeting_rooms()
+                await self.ws_manager.emit(
+                    user_id,
+                    "personal_agent.school_action",
+                    {"action": action, "result_count": len(rooms)},
+                )
+                return {"items": rooms}
+
+            if action == "create_meeting_reservation":
+                result = await client.create_room_reservation(
+                    room_id=int(payload["room_id"]),
+                    start_at=str(payload["start_at"]),
+                    end_at=str(payload["end_at"]),
+                    purpose=payload.get("purpose"),
+                )
+                await self.ws_manager.emit(
+                    user_id,
+                    "toast.notification",
+                    {
+                        "title": "회의실 예약 완료",
+                        "description": f"room_id={payload['room_id']} 예약이 생성되었습니다.",
+                    },
+                )
+                return {"item": result}
+        except SchoolApiError as exc:
+            return {"error": str(exc)}
+
+        return {"error": f"Unsupported action: {action}"}
 
     async def handle_task_due_webhook(self, payload: dict[str, Any]) -> None:
         """
@@ -64,4 +110,3 @@ class PersonalAgentService:
                     "action": {"label": "칸반 보드로 이동", "href": "/"},
                 },
             )
-

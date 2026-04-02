@@ -61,6 +61,26 @@ class PersonalAgentTriggerRequest(BaseModel):
     instruction: str = Field(min_length=3, max_length=1000)
 
 
+class PersonalSchoolActionRequest(BaseModel):
+    action: str = Field(min_length=3, max_length=100)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SnippetWriteRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+
+
+class MeetingReservationCreateRequest(BaseModel):
+    room_id: int
+    start_at: str = Field(
+        description="ISO datetime, example: 2026-04-03T10:00:00+09:00"
+    )
+    end_at: str = Field(
+        description="ISO datetime, example: 2026-04-03T11:00:00+09:00"
+    )
+    purpose: str | None = Field(default=None, max_length=500)
+
+
 class AgentEvent(BaseModel):
     event_type: str
     run_id: str | None = None
@@ -86,4 +106,3 @@ class StoredTask(BaseModel):
     due_date: date | None
     created_at: datetime
     updated_at: datetime
-

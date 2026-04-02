@@ -7,6 +7,7 @@ from app.dependencies import deep_task_orchestrator, personal_agent_service
 from app.models.schemas import (
     DeepTaskRequest,
     DeepTaskStartResponse,
+    PersonalSchoolActionRequest,
     PersonalAgentTriggerRequest,
 )
 
@@ -44,3 +45,14 @@ async def trigger_personal_agent(
         use_mock=True,
     )
 
+
+@router.post("/personal/school-action")
+async def personal_school_action(
+    body: PersonalSchoolActionRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    return await personal_agent_service.execute_school_action(
+        user_id=user_id,
+        action=body.action,
+        payload=body.payload,
+    )
