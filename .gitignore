@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Node / Next
+node_modules/
+.next/
+
+# Env files
+.env
+.env.local
+Backend/.env
+Frontend/.env.local
+
+# Runtime outputs/logs
+*.log
+Backend/outputs/
+

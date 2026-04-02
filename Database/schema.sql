@@ -72,6 +72,35 @@ create table if not exists public.tasks (
 create index if not exists idx_tasks_user_status on public.tasks(user_id, status);
 create index if not exists idx_tasks_due_date on public.tasks(due_date);
 
+-- user_settings (theme/dev-mode/approval/persona presets)
+create table if not exists public.user_settings (
+  user_id uuid primary key references public.users(id) on delete cascade,
+  settings_json jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- recent conversations
+create table if not exists public.chat_threads (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  title text not null default '새 대화',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_chat_threads_user_updated on public.chat_threads(user_id, updated_at desc);
+
+create table if not exists public.chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  thread_id uuid not null references public.chat_threads(id) on delete cascade,
+  user_id uuid not null references public.users(id) on delete cascade,
+  role text not null check (role in ('user', 'assistant', 'system')),
+  content text not null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_chat_messages_thread_created on public.chat_messages(thread_id, created_at asc);
+
 -- 4) agent_logs (RAG + feedback)
 create table if not exists public.agent_logs (
   id bigint generated always as identity primary key,
@@ -117,6 +146,16 @@ create trigger trg_tasks_set_updated_at
 before update on public.tasks
 for each row execute function public.set_updated_at();
 
+drop trigger if exists trg_user_settings_set_updated_at on public.user_settings;
+create trigger trg_user_settings_set_updated_at
+before update on public.user_settings
+for each row execute function public.set_updated_at();
+
+drop trigger if exists trg_chat_threads_set_updated_at on public.chat_threads;
+create trigger trg_chat_threads_set_updated_at
+before update on public.chat_threads
+for each row execute function public.set_updated_at();
+
 drop trigger if exists trg_agent_logs_set_updated_at on public.agent_logs;
 create trigger trg_agent_logs_set_updated_at
 before update on public.agent_logs
@@ -126,6 +165,9 @@ for each row execute function public.set_updated_at();
 alter table public.users enable row level security;
 alter table public.user_keys enable row level security;
 alter table public.tasks enable row level security;
+alter table public.user_settings enable row level security;
+alter table public.chat_threads enable row level security;
+alter table public.chat_messages enable row level security;
 alter table public.agent_logs enable row level security;
 
 -- users
@@ -200,6 +242,71 @@ on public.tasks
 for delete
 using (auth.uid() = user_id);
 
+-- user_settings
+drop policy if exists "settings_select_own" on public.user_settings;
+create policy "settings_select_own"
+on public.user_settings
+for select
+using (auth.uid() = user_id);
+
+drop policy if exists "settings_insert_own" on public.user_settings;
+create policy "settings_insert_own"
+on public.user_settings
+for insert
+with check (auth.uid() = user_id);
+
+drop policy if exists "settings_update_own" on public.user_settings;
+create policy "settings_update_own"
+on public.user_settings
+for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+-- chat_threads
+drop policy if exists "chat_threads_select_own" on public.chat_threads;
+create policy "chat_threads_select_own"
+on public.chat_threads
+for select
+using (auth.uid() = user_id);
+
+drop policy if exists "chat_threads_insert_own" on public.chat_threads;
+create policy "chat_threads_insert_own"
+on public.chat_threads
+for insert
+with check (auth.uid() = user_id);
+
+drop policy if exists "chat_threads_update_own" on public.chat_threads;
+create policy "chat_threads_update_own"
+on public.chat_threads
+for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists "chat_threads_delete_own" on public.chat_threads;
+create policy "chat_threads_delete_own"
+on public.chat_threads
+for delete
+using (auth.uid() = user_id);
+
+-- chat_messages
+drop policy if exists "chat_messages_select_own" on public.chat_messages;
+create policy "chat_messages_select_own"
+on public.chat_messages
+for select
+using (auth.uid() = user_id);
+
+drop policy if exists "chat_messages_insert_own" on public.chat_messages;
+create policy "chat_messages_insert_own"
+on public.chat_messages
+for insert
+with check (auth.uid() = user_id);
+
+drop policy if exists "chat_messages_delete_own" on public.chat_messages;
+create policy "chat_messages_delete_own"
+on public.chat_messages
+for delete
+using (auth.uid() = user_id);
+
 -- agent_logs
 drop policy if exists "agent_logs_select_own" on public.agent_logs;
 create policy "agent_logs_select_own"
@@ -232,4 +339,3 @@ begin
   return new;
 end;
 $$;
-

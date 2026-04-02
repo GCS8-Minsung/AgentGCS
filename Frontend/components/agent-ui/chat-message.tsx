@@ -1,6 +1,6 @@
 "use client";
 
-import { motion } from "motion/react";
+import { memo } from "react";
 import { Sparkles, User } from "lucide-react";
 
 interface ChatMessageProps {
@@ -9,26 +9,19 @@ interface ChatMessageProps {
   timestamp: Date;
 }
 
-export function ChatMessage({ content, role, timestamp }: ChatMessageProps) {
+function ChatMessageComponent({ content, role, timestamp }: ChatMessageProps) {
   const isUser = role === "user";
 
   return (
-    <motion.article
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      className={`flex gap-4 ${isUser ? "justify-end" : "justify-start"}`}
-    >
+    <article className={`flex gap-4 ${isUser ? "justify-end" : "justify-start"}`}>
       {!isUser && (
         <div
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-sm"
           style={{
             background:
               "linear-gradient(135deg, rgba(255, 193, 7, 0.25), rgba(255, 160, 122, 0.2))",
-            backdropFilter: "blur(12px)",
-            WebkitBackdropFilter: "blur(12px)",
             border: "1px solid rgba(255, 255, 255, 0.9)",
-            boxShadow:
-              "0 4px 15px rgba(255, 193, 7, 0.15), inset 0 0 10px rgba(255, 255, 255, 0.8)"
+            boxShadow: "0 3px 10px rgba(255, 193, 7, 0.12)"
           }}
         >
           <Sparkles className="h-5 w-5" style={{ color: "#d97706" }} />
@@ -41,12 +34,10 @@ export function ChatMessage({ content, role, timestamp }: ChatMessageProps) {
           background: isUser
             ? "linear-gradient(135deg, rgba(255, 193, 7, 0.1), rgba(255, 160, 122, 0.2))"
             : "rgba(255, 255, 255, 0.7)",
-          backdropFilter: "blur(24px)",
-          WebkitBackdropFilter: "blur(24px)",
           border: "1px solid rgba(255, 255, 255, 0.8)",
           boxShadow: isUser
-            ? "0 4px 20px rgba(255, 160, 122, 0.1), inset 0 0 15px rgba(255, 255, 255, 0.6)"
-            : "0 4px 20px rgba(0, 0, 0, 0.03), inset 0 0 15px rgba(255, 255, 255, 0.9)",
+            ? "0 4px 14px rgba(255, 160, 122, 0.1)"
+            : "0 4px 14px rgba(0, 0, 0, 0.04)",
           color: "#4a4a4a"
         }}
       >
@@ -61,17 +52,15 @@ export function ChatMessage({ content, role, timestamp }: ChatMessageProps) {
           className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-sm"
           style={{
             background: "rgba(255, 255, 255, 0.7)",
-            backdropFilter: "blur(12px)",
-            WebkitBackdropFilter: "blur(12px)",
             border: "1px solid rgba(255, 255, 255, 0.9)",
-            boxShadow:
-              "0 4px 15px rgba(255, 160, 122, 0.08), inset 0 0 10px rgba(255, 255, 255, 0.9)"
+            boxShadow: "0 3px 10px rgba(255, 160, 122, 0.08)"
           }}
         >
           <User className="h-5 w-5" style={{ color: "#d97706" }} />
         </div>
       )}
-    </motion.article>
+    </article>
   );
 }
 
+export const ChatMessage = memo(ChatMessageComponent);

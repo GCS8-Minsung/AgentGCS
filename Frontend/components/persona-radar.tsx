@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   PolarAngleAxis,
   PolarGrid,
@@ -16,15 +16,23 @@ import { PERSONA_AXES, PersonaStats } from "@/lib/types";
 type Props = {
   value: PersonaStats;
   onChange: (next: PersonaStats) => void;
+  showHeader?: boolean;
 };
 
 const SIZE = 320;
 const CENTER = SIZE / 2;
 const RADIUS = 112;
 
-export function PersonaRadar({ value, onChange }: Props) {
+function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const valueRef = useRef<PersonaStats>(value);
+  const moveRef = useRef<{ x: number; y: number } | null>(null);
+  const rafRef = useRef<number | null>(null);
   const [activeAxisIndex, setActiveAxisIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    valueRef.current = value;
+  }, [value]);
 
   const data = useMemo(
     () => PERSONA_AXES.map((axis) => ({ axis: axis.label, value: value[axis.key] })),
@@ -66,33 +74,54 @@ export function PersonaRadar({ value, onChange }: Props) {
       const projected = (dx * unit.x + dy * unit.y) / RADIUS;
       const nextValue = Math.round(Math.max(0, Math.min(1, projected)) * 100);
       const targetAxis = PERSONA_AXES[axisIndex];
-      onChange({ ...value, [targetAxis.key]: nextValue });
+      const currentValue = valueRef.current[targetAxis.key];
+      if (currentValue === nextValue) return;
+      onChange({ ...valueRef.current, [targetAxis.key]: nextValue });
     },
-    [axisVectors, onChange, value]
+    [axisVectors, onChange]
   );
 
   useEffect(() => {
     if (activeAxisIndex === null) return;
     const move = (event: PointerEvent) => {
-      updateAxisByPointer(activeAxisIndex, event.clientX, event.clientY);
+      moveRef.current = { x: event.clientX, y: event.clientY };
+      if (rafRef.current !== null) return;
+      rafRef.current = window.requestAnimationFrame(() => {
+        const point = moveRef.current;
+        if (point) {
+          updateAxisByPointer(activeAxisIndex, point.x, point.y);
+        }
+        rafRef.current = null;
+      });
     };
-    const up = () => setActiveAxisIndex(null);
+    const up = () => {
+      setActiveAxisIndex(null);
+      moveRef.current = null;
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     return () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
     };
   }, [activeAxisIndex, updateAxisByPointer]);
 
   return (
     <Card className="space-y-4">
-      <div>
-        <CardTitle>Persona Control (6축 헥사곤)</CardTitle>
-        <CardDescription>
-          각 점을 드래그해서 성향(0~100)을 조정하고 JSON으로 백엔드에 전달합니다.
-        </CardDescription>
-      </div>
+      {showHeader && (
+        <div>
+          <CardTitle>Persona Control (6축 헥사곤)</CardTitle>
+          <CardDescription>각 점을 드래그해서 성향(0~100)을 조정합니다.</CardDescription>
+        </div>
+      )}
 
       <div className="relative mx-auto h-[320px] w-[320px]">
         <ResponsiveContainer width="100%" height="100%">
@@ -112,6 +141,7 @@ export function PersonaRadar({ value, onChange }: Props) {
               fillOpacity={0.35}
               stroke="#f97316"
               strokeWidth={2}
+              isAnimationActive={false}
             />
           </RadarChart>
         </ResponsiveContainer>
@@ -158,6 +188,7 @@ export function PersonaRadar({ value, onChange }: Props) {
                 const clamped = Number.isFinite(numeric)
                   ? Math.max(0, Math.min(100, numeric))
                   : 0;
+                if (value[axis.key] === clamped) return;
                 onChange({ ...value, [axis.key]: clamped });
               }}
             />
@@ -165,9 +196,8 @@ export function PersonaRadar({ value, onChange }: Props) {
         ))}
       </div>
 
-      <pre className="overflow-x-auto rounded-2xl bg-gradient-to-r from-orange-50 to-amber-50 p-3 text-xs text-orange-900">
-        {JSON.stringify(value, null, 2)}
-      </pre>
     </Card>
   );
 }
+
+export const PersonaRadar = memo(PersonaRadarComponent);

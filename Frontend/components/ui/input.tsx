@@ -8,7 +8,7 @@ export const Input = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <input
     className={cn(
-      "h-10 w-full rounded-2xl border border-white/80 bg-white/55 px-3 text-sm text-gray-800 shadow-sm outline-none placeholder:text-orange-900/35 focus:border-orange-300 focus:ring-2 focus:ring-orange-200/50",
+      "h-10 w-full rounded-2xl border border-white/80 bg-white/55 px-3 text-sm text-gray-800 shadow-sm outline-none placeholder:text-orange-900/35 focus:border-orange-300 focus:ring-2 focus:ring-orange-200/50 dark:border-white/20 dark:bg-slate-800/70 dark:text-slate-100 dark:placeholder:text-slate-300/40",
       className
     )}
     style={{

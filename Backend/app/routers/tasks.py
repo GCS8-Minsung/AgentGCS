@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.core.auth import get_current_user_id
 from app.core.supabase_client import get_supabase_admin
 from app.models.schemas import TaskCreate, TaskUpdate
+from app.services.dev_store import dev_store
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -22,8 +23,12 @@ async def list_tasks(user_id: str = Depends(get_current_user_id)) -> dict:
             .execute()
         )
 
-    result = await asyncio.to_thread(_select)
-    return {"items": result.data or []}
+    try:
+        result = await asyncio.to_thread(_select)
+        return {"items": result.data or [], "source": "supabase"}
+    except Exception:
+        items = await dev_store.list_tasks(user_id)
+        return {"items": items, "source": "dev_store"}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -38,8 +43,16 @@ async def create_task(body: TaskCreate, user_id: str = Depends(get_current_user_
         client = get_supabase_admin()
         return client.table("tasks").insert(payload).execute()
 
-    result = await asyncio.to_thread(_insert)
-    return {"item": (result.data or [None])[0]}
+    try:
+        result = await asyncio.to_thread(_insert)
+        row = (result.data or [None])[0]
+        if row:
+            return {"item": row, "source": "supabase"}
+    except Exception:
+        pass
+
+    row = await dev_store.create_task(user_id, payload)
+    return {"item": row, "source": "dev_store"}
 
 
 @router.patch("/{task_id}")
@@ -58,8 +71,18 @@ async def update_task(task_id: str, body: TaskUpdate, user_id: str = Depends(get
             .execute()
         )
 
-    result = await asyncio.to_thread(_update)
-    return {"item": (result.data or [None])[0]}
+    try:
+        result = await asyncio.to_thread(_update)
+        row = (result.data or [None])[0]
+        if row:
+            return {"item": row, "source": "supabase"}
+    except Exception:
+        pass
+
+    row = await dev_store.update_task(user_id, task_id, updates)
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"item": row, "source": "dev_store"}
 
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -68,5 +91,7 @@ async def delete_task(task_id: str, user_id: str = Depends(get_current_user_id))
         client = get_supabase_admin()
         return client.table("tasks").delete().eq("id", task_id).eq("user_id", user_id).execute()
 
-    await asyncio.to_thread(_delete)
-
+    try:
+        await asyncio.to_thread(_delete)
+    except Exception:
+        await dev_store.delete_task(user_id, task_id)

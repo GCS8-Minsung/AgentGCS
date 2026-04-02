@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.security import EncryptedPayload
 from app.core.security import SecurityManager
 from app.core.supabase_client import get_supabase_admin
+from app.services.dev_store import dev_store
 
 
 SCHOOL_API_BASE_URL = "https://api.1000.school"
@@ -130,6 +131,26 @@ class SchoolApiClient:
 
 
 async def get_school_client_for_user(user_id: str) -> SchoolApiClient:
+    fallback_token = settings.school_api_token or settings.anthropic_auth_token
+
+    if not settings.supabase_url or not settings.supabase_service_role_key:
+        local_row = await dev_store.get_user_key(user_id, "school_api_token")
+        if local_row:
+            decrypted = _security_manager.decrypt_text(
+                EncryptedPayload(
+                    nonce=local_row["nonce"],
+                    ciphertext=local_row["encrypted_value"],
+                    key_version=local_row.get("key_version", 1),
+                ),
+                aad=user_id,
+            )
+            return SchoolApiClient(bearer_token=decrypted)
+        if fallback_token:
+            return SchoolApiClient(bearer_token=fallback_token)
+        raise SchoolApiError(
+            "Supabase key-store is disabled and no SCHOOL_API_TOKEN/ANTHROPIC_AUTH_TOKEN is set."
+        )
+
     def _fetch_key():
         client = get_supabase_admin()
         return (
@@ -141,9 +162,26 @@ async def get_school_client_for_user(user_id: str) -> SchoolApiClient:
             .execute()
         )
 
-    result = await asyncio.to_thread(_fetch_key)
-    row = (result.data or [None])[0]
+    try:
+        result = await asyncio.to_thread(_fetch_key)
+        row = (result.data or [None])[0]
+    except Exception:
+        row = None
+
     if not row:
+        local_row = await dev_store.get_user_key(user_id, "school_api_token")
+        if local_row:
+            decrypted = _security_manager.decrypt_text(
+                EncryptedPayload(
+                    nonce=local_row["nonce"],
+                    ciphertext=local_row["encrypted_value"],
+                    key_version=local_row.get("key_version", 1),
+                ),
+                aad=user_id,
+            )
+            return SchoolApiClient(bearer_token=decrypted)
+        if fallback_token:
+            return SchoolApiClient(bearer_token=fallback_token)
         raise SchoolApiError(
             "school_api_token not found. Save it first via POST /api/keys with key_name=school_api_token."
         )

@@ -16,6 +16,10 @@ class Settings(BaseSettings):
 
     encryption_master_key: str = ""
     claude_api_key: str | None = None
+    anthropic_base_url: str | None = None
+    anthropic_auth_token: str | None = None
+    claude_model: str | None = None
+    school_api_token: str | None = None
 
     notebooklm_cli_path: str = "notebooklm-mcp-cli"
     notebooklm_output_dir: str = "./outputs"
@@ -32,4 +36,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

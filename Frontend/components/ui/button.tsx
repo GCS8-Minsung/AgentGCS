@@ -13,8 +13,9 @@ const buttonVariants = cva(
         default:
           "border border-white/60 bg-gradient-to-r from-orange-400 to-amber-400 text-white shadow-[0_10px_22px_-12px_rgba(255,160,122,0.7)] hover:brightness-95",
         secondary:
-          "border border-white/80 bg-white/55 text-orange-900/85 hover:bg-white/70",
-        ghost: "bg-transparent text-orange-900/85 hover:bg-white/40",
+          "border border-white/80 bg-white/55 text-orange-900/85 hover:bg-white/70 dark:border-white/25 dark:bg-slate-800/70 dark:text-slate-100 dark:hover:bg-slate-700/70",
+        ghost:
+          "bg-transparent text-orange-900/85 hover:bg-white/40 dark:text-slate-100 dark:hover:bg-slate-700/40",
         accent:
           "border border-white/60 bg-gradient-to-r from-amber-300 to-orange-300 text-white shadow-[0_8px_18px_-8px_rgba(245,158,11,0.8)] hover:brightness-95"
       },

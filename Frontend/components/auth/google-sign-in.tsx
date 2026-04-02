@@ -19,7 +19,7 @@ export function GoogleSignInCard({ onUserChange }: Props) {
 
   useEffect(() => {
     if (!supabase) {
-      onUserChange(DEMO_USER_ID, "demo@local");
+      onUserChange(DEMO_USER_ID, null);
       return;
     }
 
@@ -27,7 +27,7 @@ export function GoogleSignInCard({ onUserChange }: Props) {
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return;
       const uid = data.session?.user.id ?? DEMO_USER_ID;
-      const nextEmail = data.session?.user.email ?? "demo@local";
+      const nextEmail = data.session?.user.email ?? null;
       setUserId(uid);
       setEmail(nextEmail);
       onUserChange(uid, nextEmail);
@@ -37,7 +37,7 @@ export function GoogleSignInCard({ onUserChange }: Props) {
       data: { subscription }
     } = supabase.auth.onAuthStateChange((_event, session) => {
       const uid = session?.user.id ?? DEMO_USER_ID;
-      const nextEmail = session?.user.email ?? "demo@local";
+      const nextEmail = session?.user.email ?? null;
       setUserId(uid);
       setEmail(nextEmail);
       onUserChange(uid, nextEmail);
@@ -112,4 +112,3 @@ export function GoogleSignInCard({ onUserChange }: Props) {
     </Card>
   );
 }
-

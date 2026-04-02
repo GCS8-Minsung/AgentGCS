@@ -4,27 +4,29 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import { Paperclip, Scale, Send, ShieldCheck, Sparkles, Zap } from "lucide-react";
 
+import { AutonomyMode } from "@/lib/types";
+
 interface ChatInputProps {
-  onSend: (message: string, autonomyLevel: number) => void;
+  onSend: (message: string, autonomyMode: AutonomyMode) => void;
   isCenter: boolean;
   disabled?: boolean;
 }
 
 export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps) {
   const [message, setMessage] = useState("");
-  const [autonomyLevel, setAutonomyLevel] = useState(1);
+  const [autonomyMode, setAutonomyMode] = useState<AutonomyMode>("balanced");
 
   const levels = [
-    { id: 0, label: "신중함", icon: ShieldCheck },
-    { id: 1, label: "균형형", icon: Scale },
-    { id: 2, label: "창의적", icon: Sparkles },
-    { id: 3, label: "완전자율", icon: Zap }
+    { id: "cautious", label: "신중함", icon: ShieldCheck },
+    { id: "balanced", label: "균형형", icon: Scale },
+    { id: "creative", label: "창의적", icon: Sparkles },
+    { id: "autonomous", label: "완전자율", icon: Zap }
   ];
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     if (!message.trim() || disabled) return;
-    onSend(message.trim(), autonomyLevel);
+    onSend(message.trim(), autonomyMode);
     setMessage("");
   }
 
@@ -59,7 +61,7 @@ export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             disabled={disabled}
-            placeholder={disabled ? "에이전트가 응답 생성 중입니다..." : "과제 또는 요청을 입력하세요..."}
+            placeholder={disabled ? "에이전트가 응답 생성 중입니다..." : "AI와 대화할 메시지를 입력하세요..."}
             className={`flex-1 bg-transparent text-gray-800 outline-none placeholder:text-orange-900/40 ${
               disabled ? "cursor-not-allowed opacity-60" : ""
             }`}
@@ -109,12 +111,12 @@ export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps
           >
             {levels.map((level) => {
               const Icon = level.icon;
-              const selected = autonomyLevel === level.id;
+              const selected = autonomyMode === level.id;
               return (
                 <button
                   key={level.id}
                   type="button"
-                  onClick={() => setAutonomyLevel(level.id)}
+                  onClick={() => setAutonomyMode(level.id as AutonomyMode)}
                   className={`flex items-center gap-1.5 whitespace-nowrap rounded-xl px-3 py-2 text-[12px] font-semibold transition-all ${
                     selected
                       ? "border border-orange-100/50 bg-white text-orange-600 shadow-sm"
@@ -142,4 +144,3 @@ export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps
     </motion.div>
   );
 }
-

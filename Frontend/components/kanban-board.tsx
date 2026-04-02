@@ -23,16 +23,19 @@ const COLUMNS: { key: TaskStatus; label: string }[] = [
 export function KanbanBoard({ userId }: Props) {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [dueDate, setDueDate] = useState("");
 
   async function load() {
     setLoading(true);
+    setErrorText(null);
     try {
       const response = await fetchTasks(userId);
       setTasks(response.items);
     } catch (error) {
-      console.error(error);
+      setTasks([]);
+      setErrorText((error as Error).message);
     } finally {
       setLoading(false);
     }
@@ -45,21 +48,31 @@ export function KanbanBoard({ userId }: Props) {
 
   async function addTask() {
     if (!title.trim()) return;
-    const response = await createTask(userId, {
-      title: title.trim(),
-      due_date: dueDate || null,
-      status: "todo"
-    });
-    setTasks((current) => [...current, response.item]);
-    setTitle("");
-    setDueDate("");
+    try {
+      const response = await createTask(userId, {
+        title: title.trim(),
+        due_date: dueDate || null,
+        status: "todo"
+      });
+      setTasks((current) => [...current, response.item]);
+      setTitle("");
+      setDueDate("");
+      setErrorText(null);
+    } catch (error) {
+      setErrorText((error as Error).message);
+    }
   }
 
   async function moveTask(taskId: string, status: TaskStatus) {
-    const response = await updateTask(userId, taskId, { status });
-    setTasks((current) =>
-      current.map((task) => (task.id === taskId ? { ...task, ...response.item } : task))
-    );
+    try {
+      const response = await updateTask(userId, taskId, { status });
+      setTasks((current) =>
+        current.map((task) => (task.id === taskId ? { ...task, ...response.item } : task))
+      );
+      setErrorText(null);
+    } catch (error) {
+      setErrorText((error as Error).message);
+    }
   }
 
   const grouped = useMemo(() => {
@@ -95,6 +108,11 @@ export function KanbanBoard({ userId }: Props) {
           새로고침
         </Button>
       </div>
+      {errorText && (
+        <p className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {errorText}
+        </p>
+      )}
 
       <section className="grid grid-cols-1 gap-3 xl:grid-cols-4">
         {COLUMNS.map((column) => (

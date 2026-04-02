@@ -19,9 +19,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ko">
+    <html lang="ko" suppressHydrationWarning>
       <body className={`${spaceGrotesk.variable} antialiased`}>{children}</body>
     </html>
   );
 }
-

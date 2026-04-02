@@ -106,3 +106,55 @@ class StoredTask(BaseModel):
     due_date: date | None
     created_at: datetime
     updated_at: datetime
+
+
+class PersonaProfile(BaseModel):
+    id: str = Field(min_length=2, max_length=80)
+    name: str = Field(min_length=1, max_length=80)
+    stats: PersonaStats
+
+
+class ApprovalPolicy(BaseModel):
+    cautious_requires_approval: bool = True
+    balanced_requires_approval: bool = True
+    creative_requires_approval: bool = True
+    autonomous_needs_first_warning: bool = True
+    autonomous_warning_accepted: bool = False
+
+
+class UserSettingsPayload(BaseModel):
+    theme: Literal["light", "dark", "system"] = "system"
+    dev_mode: bool = False
+    claude_base_url: str | None = Field(default=None, max_length=500)
+    preferred_model: str | None = Field(default=None, max_length=120)
+    default_notify_email: EmailStr | None = None
+    active_persona_id: str | None = None
+    personas: list[PersonaProfile] = Field(default_factory=list)
+    approval_policy: ApprovalPolicy = Field(default_factory=ApprovalPolicy)
+
+
+class ConversationThreadCreateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    thread_id: str | None = Field(default=None, max_length=120)
+
+
+class ConversationMessageCreateRequest(BaseModel):
+    role: Literal["user", "assistant", "system"] = "user"
+    content: str = Field(min_length=1, max_length=6000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=6000)
+    thread_id: str | None = Field(default=None, max_length=120)
+    title: str | None = Field(default=None, max_length=120)
+    mode: Literal["cautious", "balanced", "creative", "autonomous"] = "balanced"
+    persona_stats: PersonaStats | None = None
+    use_mock: bool = False
+
+
+class UserBootstrapRequest(BaseModel):
+    user_id: str = Field(min_length=3, max_length=120)
+    email: EmailStr | None = None
+    full_name: str | None = Field(default=None, max_length=120)
+    avatar_url: str | None = Field(default=None, max_length=500)

@@ -1,4 +1,14 @@
-import { PersonaStats, TaskItem, TaskStatus } from "@/lib/types";
+import {
+  ApiKeyMeta,
+  AutonomyMode,
+  ClaudeConnectionStatus,
+  ConversationMessage,
+  ConversationThread,
+  PersonaStats,
+  TaskItem,
+  TaskStatus,
+  UserSettings
+} from "@/lib/types";
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -7,14 +17,21 @@ async function request<T>(
   userId: string,
   options?: RequestInit
 ): Promise<T> {
-  const response = await fetch(`${backendUrl}${path}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      "x-user-id": userId,
-      ...(options?.headers ?? {})
-    }
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${backendUrl}${path}`, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        "x-user-id": userId,
+        ...(options?.headers ?? {})
+      }
+    });
+  } catch (error) {
+    throw new Error(
+      `백엔드 연결 실패 (${backendUrl}). 백엔드 서버(8000)가 실행 중인지 확인해주세요. ${(error as Error).message}`
+    );
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -45,7 +62,7 @@ export async function startDeepTask(params: {
       task: params.task,
       persona_stats: params.personaStats,
       notify_email: params.notifyEmail ?? null,
-      use_mock: params.useMock ?? true
+      use_mock: params.useMock ?? false
     })
   });
 }
@@ -95,3 +112,153 @@ export async function updateTask(
   });
 }
 
+export async function bootstrapUser(params: {
+  userId: string;
+  email?: string | null;
+  fullName?: string | null;
+  avatarUrl?: string | null;
+}) {
+  return request<{ status: string; user_id: string; source: string }>(
+    "/api/users/bootstrap",
+    params.userId,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: params.userId,
+        email: params.email ?? null,
+        full_name: params.fullName ?? null,
+        avatar_url: params.avatarUrl ?? null
+      })
+    }
+  );
+}
+
+export async function fetchWorkspaceSettings(userId: string) {
+  return request<{ settings: UserSettings; source: string }>(
+    "/api/workspace/settings",
+    userId,
+    {
+      method: "GET"
+    }
+  );
+}
+
+export async function saveWorkspaceSettings(userId: string, settings: UserSettings) {
+  return request<{ settings: UserSettings; source: string }>(
+    "/api/workspace/settings",
+    userId,
+    {
+      method: "PUT",
+      body: JSON.stringify(settings)
+    }
+  );
+}
+
+export async function fetchConversations(userId: string, limit = 20) {
+  return request<{ items: ConversationThread[]; source: string }>(
+    `/api/workspace/conversations?limit=${limit}`,
+    userId,
+    { method: "GET" }
+  );
+}
+
+export async function createConversation(
+  userId: string,
+  payload: { title?: string | null; thread_id?: string | null }
+) {
+  return request<{ item: ConversationThread; source: string }>(
+    "/api/workspace/conversations",
+    userId,
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }
+  );
+}
+
+export async function fetchConversationMessages(
+  userId: string,
+  threadId: string,
+  limit = 100
+) {
+  return request<{ items: ConversationMessage[]; source: string }>(
+    `/api/workspace/conversations/${threadId}/messages?limit=${limit}`,
+    userId,
+    { method: "GET" }
+  );
+}
+
+export async function appendConversationMessage(
+  userId: string,
+  threadId: string,
+  payload: {
+    role: "user" | "assistant" | "system";
+    content: string;
+    metadata?: Record<string, unknown>;
+  }
+) {
+  return request<{ item: ConversationMessage; source: string }>(
+    `/api/workspace/conversations/${threadId}/messages`,
+    userId,
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }
+  );
+}
+
+export async function agentChat(params: {
+  userId: string;
+  message: string;
+  threadId?: string | null;
+  title?: string | null;
+  mode: AutonomyMode;
+  personaStats?: PersonaStats | null;
+  useMock?: boolean;
+}) {
+  return request<{
+    thread_id: string;
+    reply: string;
+    assistant_message: ConversationMessage;
+    mode: AutonomyMode;
+  }>("/api/agents/chat", params.userId, {
+    method: "POST",
+    body: JSON.stringify({
+      message: params.message,
+      thread_id: params.threadId ?? null,
+      title: params.title ?? null,
+      mode: params.mode,
+      persona_stats: params.personaStats ?? null,
+      use_mock: params.useMock ?? false
+    })
+  });
+}
+
+export async function fetchConnectionStatus(userId: string) {
+  return request<{
+    claude: ClaudeConnectionStatus;
+    school_api: { token_saved: boolean };
+  }>("/api/agents/connection-status", userId, {
+    method: "GET"
+  });
+}
+
+export async function listUserKeys(userId: string) {
+  return request<{ items: ApiKeyMeta[]; source: string }>("/api/keys", userId, {
+    method: "GET"
+  });
+}
+
+export async function storeUserKey(
+  userId: string,
+  payload: { key_name: string; plaintext_key: string }
+) {
+  return request<{ status: string; key_name: string; source: string }>(
+    "/api/keys",
+    userId,
+    {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }
+  );
+}

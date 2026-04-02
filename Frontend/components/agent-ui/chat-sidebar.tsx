@@ -1,6 +1,6 @@
 "use client";
 
-import { MessageSquare, Plus, Settings, User } from "lucide-react";
+import { Clock3, MessageSquare, Plus, Settings, User } from "lucide-react";
 import { motion } from "motion/react";
 
 export interface SidebarItem {
@@ -9,18 +9,32 @@ export interface SidebarItem {
   subtitle: string;
 }
 
+export interface ConversationPreview {
+  id: string;
+  title: string;
+  updated_at?: string;
+}
+
 interface ChatSidebarProps {
   items: SidebarItem[];
   activeItem: string | null;
   onSelectItem: (id: string) => void;
   onReset: () => void;
+  conversations: ConversationPreview[];
+  activeConversationId: string | null;
+  onSelectConversation: (conversationId: string) => void;
+  onOpenSettings: () => void;
 }
 
 export function ChatSidebar({
   items,
   activeItem,
   onSelectItem,
-  onReset
+  onReset,
+  conversations,
+  activeConversationId,
+  onSelectConversation,
+  onOpenSettings
 }: ChatSidebarProps) {
   return (
     <motion.aside
@@ -52,7 +66,7 @@ export function ChatSidebar({
         <span className="text-sm font-semibold tracking-wide">새 워크플로우 시작</span>
       </button>
 
-      <div className="flex-1 space-y-3 overflow-y-auto pr-2 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-orange-200/50 [&::-webkit-scrollbar-track]:bg-transparent">
+      <div className="space-y-3">
         {items.map((item) => (
           <motion.button
             key={item.id}
@@ -96,8 +110,41 @@ export function ChatSidebar({
         ))}
       </div>
 
+      <div className="min-h-0 flex-1 overflow-y-auto border-t border-white/50 pt-4">
+        <p className="mb-2 px-1 text-xs font-semibold tracking-wide text-orange-900/55">이전 대화</p>
+        <div className="space-y-2 pr-2 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-orange-200/50 [&::-webkit-scrollbar-track]:bg-transparent">
+          {conversations.length === 0 && (
+            <div className="rounded-xl border border-white/70 bg-white/40 px-3 py-2 text-xs text-orange-900/60">
+              아직 저장된 대화가 없습니다.
+            </div>
+          )}
+          {conversations.map((conversation) => (
+            <button
+              key={conversation.id}
+              type="button"
+              onClick={() => onSelectConversation(conversation.id)}
+              className={`w-full rounded-xl border px-3 py-2 text-left transition-all ${
+                activeConversationId === conversation.id
+                  ? "border-orange-300 bg-white/90"
+                  : "border-white/70 bg-white/45 hover:bg-white/70"
+              }`}
+            >
+              <p className="truncate text-xs font-semibold text-gray-800">{conversation.title}</p>
+              <p className="mt-1 flex items-center gap-1 text-[10px] text-orange-900/55">
+                <Clock3 className="h-3 w-3" />
+                {conversation.updated_at
+                  ? new Date(conversation.updated_at).toLocaleString()
+                  : "시간 정보 없음"}
+              </p>
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className="relative z-20 mt-auto border-t border-white/50 pt-5">
         <button
+          type="button"
+          onClick={onOpenSettings}
           className="group w-full rounded-2xl px-3 py-3.5 transition-all hover:bg-white/50"
           style={{
             backdropFilter: "blur(12px)",
@@ -123,4 +170,3 @@ export function ChatSidebar({
     </motion.aside>
   );
 }
-

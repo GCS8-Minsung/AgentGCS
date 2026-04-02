@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { Loader2, MessageCircleDashed, Search, Sparkles, TriangleAlert } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -11,7 +12,8 @@ type Props = {
   running: boolean;
 };
 
-function formatPayload(payload: Record<string, unknown>) {
+function formatPayload(payload: Record<string, unknown> | null | undefined) {
+  if (!payload || typeof payload !== "object") return "(payload 없음)";
   if (typeof payload.message === "string") return payload.message;
   if (typeof payload.summary === "string") return payload.summary;
   return JSON.stringify(payload);
@@ -26,7 +28,10 @@ function eventIcon(type: string) {
 }
 
 export function GenerativeFeed({ events, running }: Props) {
-  const sorted = [...events].reverse();
+  const sorted = useMemo(() => {
+    const recent = events.slice(-80);
+    return [...recent].reverse();
+  }, [events]);
   return (
     <Card className="space-y-4">
       <div className="flex items-center justify-between">
@@ -59,8 +64,8 @@ export function GenerativeFeed({ events, running }: Props) {
             </p>
             {event.event_type === "deep_task.debate_turn" && (
               <p className="mt-2 text-xs text-orange-900/70">
-                Persona: {String(event.payload.persona_label ?? "-")} / Score:{" "}
-                {String(event.payload.weight_score ?? "-")}
+                Persona: {String(event.payload?.persona_label ?? "-")} / Score:{" "}
+                {String(event.payload?.weight_score ?? "-")}
               </p>
             )}
           </article>
