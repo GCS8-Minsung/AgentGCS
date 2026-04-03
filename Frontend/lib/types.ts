@@ -100,3 +100,9 @@ export type ClaudeConnectionStatus = {
   status: string;
   attempts: Array<Record<string, unknown>>;
 };
+
+export type WorkspaceConnectionStatus = {
+  claude: ClaudeConnectionStatus;
+  school_api: { token_saved: boolean };
+  google_workspace: { token_saved: boolean };
+};

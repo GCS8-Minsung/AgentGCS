@@ -1,7 +1,6 @@
 "use client";
 
 import { Clock3, MessageSquare, Plus, Settings, User } from "lucide-react";
-import { motion } from "motion/react";
 
 export interface SidebarItem {
   id: string;
@@ -37,17 +36,13 @@ export function ChatSidebar({
   onOpenSettings
 }: ChatSidebarProps) {
   return (
-    <motion.aside
-      initial={{ x: -300, opacity: 0 }}
-      animate={{ x: 0, opacity: 1 }}
+    <aside
       className="hidden h-full w-80 flex-col gap-6 p-6 lg:flex"
       style={{
         background:
           "linear-gradient(180deg, rgba(255, 255, 255, 0.65), rgba(255, 255, 255, 0.45))",
-        backdropFilter: "blur(30px)",
-        WebkitBackdropFilter: "blur(30px)",
         borderRight: "1px solid rgba(255, 255, 255, 0.9)",
-        boxShadow: "10px 0 40px rgba(255, 160, 122, 0.08)"
+        boxShadow: "8px 0 24px rgba(255, 160, 122, 0.08)"
       }}
     >
       <button
@@ -68,11 +63,9 @@ export function ChatSidebar({
 
       <div className="space-y-3">
         {items.map((item) => (
-          <motion.button
+          <button
             key={item.id}
             onClick={() => onSelectItem(item.id)}
-            whileHover={{ scale: 1.02, x: 5 }}
-            whileTap={{ scale: 0.98 }}
             className="group w-full rounded-2xl px-5 py-4 text-left transition-all"
             style={{
               background:
@@ -106,7 +99,7 @@ export function ChatSidebar({
                 <p className="mt-1 text-[11px] font-medium opacity-60">{item.subtitle}</p>
               </div>
             </div>
-          </motion.button>
+          </button>
         ))}
       </div>
 
@@ -146,10 +139,6 @@ export function ChatSidebar({
           type="button"
           onClick={onOpenSettings}
           className="group w-full rounded-2xl px-3 py-3.5 transition-all hover:bg-white/50"
-          style={{
-            backdropFilter: "blur(12px)",
-            WebkitBackdropFilter: "blur(12px)"
-          }}
         >
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -167,6 +156,6 @@ export function ChatSidebar({
           </div>
         </button>
       </div>
-    </motion.aside>
+    </aside>
   );
 }

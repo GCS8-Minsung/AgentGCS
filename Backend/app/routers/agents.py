@@ -18,6 +18,18 @@ from app.services.dev_store import dev_store
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
+async def _ensure_supabase_user(user_id: str) -> None:
+    def _upsert_user():
+        client = get_supabase_admin()
+        payload = {"id": user_id, "email": f"{user_id}@local.agentgcs.invalid"}
+        return client.table("users").upsert(payload).execute()
+
+    try:
+        await asyncio.to_thread(_upsert_user)
+    except Exception:
+        return
+
+
 @router.post("/deep-task/start", response_model=DeepTaskStartResponse)
 async def start_deep_task(
     body: DeepTaskRequest,
@@ -74,22 +86,77 @@ def _mode_system_instruction(mode: str) -> str:
 
 
 async def _ensure_thread(user_id: str, thread_id: str | None, title: str | None) -> dict:
-    local = await dev_store.ensure_thread(user_id, thread_id, title or "새 대화")
+    await _ensure_supabase_user(user_id)
+    requested_thread_id = thread_id
+
+    async def _find_owned_thread(target_id: str) -> dict | None:
+        def _select():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_threads")
+                .select("id,user_id,title,created_at,updated_at")
+                .eq("id", target_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_select)
+        return (result.data or [None])[0]
+
+    final_thread_id = str(uuid4())
+    if requested_thread_id:
+        try:
+            owned = await _find_owned_thread(requested_thread_id)
+            if owned:
+                final_thread_id = owned["id"]
+            else:
+                final_thread_id = requested_thread_id
+        except Exception:
+            final_thread_id = requested_thread_id
+
+    local = await dev_store.ensure_thread(user_id, final_thread_id, title or "새 대화")
     try:
-        def _upsert():
+        def _insert():
             client = get_supabase_admin()
             payload = {
-                "id": local["id"],
+                "id": final_thread_id,
                 "user_id": user_id,
                 "title": local["title"],
             }
-            return client.table("chat_threads").upsert(payload).execute()
+            return client.table("chat_threads").insert(payload).execute()
 
-        result = await asyncio.to_thread(_upsert)
+        result = await asyncio.to_thread(_insert)
         row = (result.data or [local])[0]
         return row
     except Exception:
-        return local
+        if requested_thread_id:
+            try:
+                owned = await _find_owned_thread(requested_thread_id)
+                if owned:
+                    return owned
+            except Exception:
+                pass
+
+        fallback_thread_id = str(uuid4())
+        fallback_local = await dev_store.ensure_thread(
+            user_id, fallback_thread_id, title or "새 대화"
+        )
+        try:
+            def _insert_fallback():
+                client = get_supabase_admin()
+                payload = {
+                    "id": fallback_thread_id,
+                    "user_id": user_id,
+                    "title": fallback_local["title"],
+                }
+                return client.table("chat_threads").insert(payload).execute()
+
+            fallback_result = await asyncio.to_thread(_insert_fallback)
+            row = (fallback_result.data or [fallback_local])[0]
+            return row
+        except Exception:
+            return fallback_local
 
 
 async def _append_message(
@@ -182,26 +249,33 @@ async def chat_with_agent(
 async def get_connection_status(user_id: str = Depends(get_current_user_id)) -> dict:
     claude = await claude_service.diagnose_connection()
 
-    school_key_found = False
-    try:
-        def _find_school_key():
-            client = get_supabase_admin()
-            return (
-                client.table("user_keys")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("key_name", "school_api_token")
-                .limit(1)
-                .execute()
-            )
+    async def _find_key_exists(key_name: str) -> bool:
+        try:
+            def _find_key():
+                client = get_supabase_admin()
+                return (
+                    client.table("user_keys")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("key_name", key_name)
+                    .limit(1)
+                    .execute()
+                )
 
-        result = await asyncio.to_thread(_find_school_key)
-        school_key_found = bool(result.data)
-    except Exception:
-        row = await dev_store.get_user_key(user_id, "school_api_token")
-        school_key_found = bool(row)
+            result = await asyncio.to_thread(_find_key)
+            if result.data:
+                return True
+        except Exception:
+            pass
+
+        row = await dev_store.get_user_key(user_id, key_name)
+        return bool(row)
+
+    school_key_found = await _find_key_exists("school_api_token")
+    google_key_found = await _find_key_exists("google_oauth_access_token")
 
     return {
         "claude": claude,
         "school_api": {"token_saved": school_key_found},
+        "google_workspace": {"token_saved": google_key_found},
     }

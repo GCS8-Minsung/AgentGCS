@@ -1,26 +1,30 @@
 import {
   ApiKeyMeta,
   AutonomyMode,
-  ClaudeConnectionStatus,
   ConversationMessage,
   ConversationThread,
   PersonaStats,
   TaskItem,
   TaskStatus,
+  WorkspaceConnectionStatus,
   UserSettings
 } from "@/lib/types";
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const REQUEST_TIMEOUT_MS = 15000;
 
 async function request<T>(
   path: string,
   userId: string,
   options?: RequestInit
 ): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(`${backendUrl}${path}`, {
       ...options,
+      signal: options?.signal ?? controller.signal,
       headers: {
         "Content-Type": "application/json",
         "x-user-id": userId,
@@ -28,9 +32,16 @@ async function request<T>(
       }
     });
   } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      throw new Error(
+        `요청 시간 초과 (${REQUEST_TIMEOUT_MS / 1000}초): ${backendUrl}${path}. 백엔드 상태를 확인해주세요.`
+      );
+    }
     throw new Error(
       `백엔드 연결 실패 (${backendUrl}). 백엔드 서버(8000)가 실행 중인지 확인해주세요. ${(error as Error).message}`
     );
+  } finally {
+    window.clearTimeout(timeout);
   }
 
   if (!response.ok) {
@@ -235,10 +246,7 @@ export async function agentChat(params: {
 }
 
 export async function fetchConnectionStatus(userId: string) {
-  return request<{
-    claude: ClaudeConnectionStatus;
-    school_api: { token_saved: boolean };
-  }>("/api/agents/connection-status", userId, {
+  return request<WorkspaceConnectionStatus>("/api/agents/connection-status", userId, {
     method: "GET"
   });
 }

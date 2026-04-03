@@ -17,9 +17,10 @@ async def bootstrap_user(
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     final_user_id = user_id
+    fallback_email = f"{final_user_id}@local.agentgcs.invalid"
     payload = {
         "id": final_user_id,
-        "email": body.email or "unknown@example.com",
+        "email": body.email or fallback_email,
         "full_name": body.full_name,
         "avatar_url": body.avatar_url,
     }

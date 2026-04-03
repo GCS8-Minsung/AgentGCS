@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useId, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -35,7 +35,7 @@ function AIIndicatorComponent({
 }: AIIndicatorProps) {
   const [isHovered, setIsHovered] = useState(false);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
-  const gradientId = useId();
+  const [spinState, setSpinState] = useState<"idle" | "slow" | "fast" | "stopping">("idle");
 
   const options = useMemo(() => {
     const fallback = isChatStarted ? DEFAULT_NEXT_STEPS : DEFAULT_STARTERS;
@@ -44,7 +44,28 @@ function AIIndicatorComponent({
     return source.slice(0, 5);
   }, [isChatStarted, suggestedOptions]);
 
-  const loopClass = isActive ? "capsule-loop-fast" : isHovered ? "capsule-loop-slow" : "";
+  useEffect(() => {
+    if (isActive) {
+      setSpinState("fast");
+      return;
+    }
+    if (isHovered || isMenuOpen) {
+      setSpinState("slow");
+      return;
+    }
+    setSpinState((current) => (current === "idle" ? "idle" : "stopping"));
+  }, [isActive, isHovered, isMenuOpen]);
+
+  useEffect(() => {
+    if (spinState !== "stopping") return;
+    const timer = window.setTimeout(() => setSpinState("idle"), 520);
+    return () => window.clearTimeout(timer);
+  }, [spinState]);
+
+  const isSpinning = spinState !== "idle";
+  const spinningClass = spinState === "fast" ? "capsule-flow-fast" : "capsule-flow-slow";
+  const idleGlowClass = spinState === "idle" ? "opacity-100" : spinState === "stopping" ? "opacity-40" : "opacity-0";
+  const rotatingGlowClass = isSpinning ? "opacity-100" : "opacity-0";
 
   return (
     <div
@@ -70,13 +91,6 @@ function AIIndicatorComponent({
           )}
           style={{ filter: "drop-shadow(0 8px 16px rgba(255, 200, 170, 0.12))" }}
         >
-          <defs>
-            <linearGradient id={gradientId} x1="100%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="rgba(255, 179, 0, 0)" />
-              <stop offset="50%" stopColor="#FFB300" />
-              <stop offset="100%" stopColor="rgba(255, 179, 0, 0)" />
-            </linearGradient>
-          </defs>
           <path
             d={CAPSULE_PATH}
             fill="none"
@@ -88,19 +102,32 @@ function AIIndicatorComponent({
           <path
             d={CAPSULE_PATH}
             fill="none"
-            stroke={`url(#${gradientId})`}
-            strokeWidth="6"
+            stroke="rgba(255, 179, 0, 0.92)"
+            strokeWidth="7"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={cn("capsule-idle-glow transition-opacity duration-500", idleGlowClass)}
+          />
+          <path
+            d={CAPSULE_PATH}
+            fill="none"
+            stroke="rgba(255, 179, 0, 0.95)"
+            strokeWidth="7"
             strokeLinecap="round"
             strokeLinejoin="round"
             pathLength={100}
-            className={cn("capsule-loop", loopClass)}
+            className={cn(
+              "capsule-moving-segment transition-opacity duration-500",
+              isSpinning && spinningClass,
+              rotatingGlowClass
+            )}
           />
         </svg>
       </button>
 
       <div
         className={cn(
-          "pointer-events-none absolute top-[92px] z-30 w-[320px] rounded-2xl border border-white/65 bg-white/88 p-2 shadow-xl transition-all duration-150 dark:border-slate-700 dark:bg-slate-900/92",
+          "pointer-events-none absolute bottom-[92px] z-30 w-[320px] rounded-2xl border border-white/65 bg-white/88 p-2 shadow-xl transition-all duration-150 dark:border-slate-700 dark:bg-slate-900/92",
           isMenuOpen ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0"
         )}
       >

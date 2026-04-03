@@ -21,7 +21,9 @@ type Props = {
 
 const SIZE = 320;
 const CENTER = SIZE / 2;
-const RADIUS = 112;
+const RADIUS = 104;
+const HANDLE_HALO_RADIUS = 9;
+const HANDLE_RADIUS = 6;
 
 function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -129,12 +131,12 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
             data={data}
             cx="50%"
             cy="50%"
-            outerRadius={112}
+            outerRadius={RADIUS}
             startAngle={90}
             endAngle={-270}
           >
             <PolarGrid stroke="#fb923c" strokeOpacity={0.35} />
-            <PolarAngleAxis dataKey="axis" tick={{ fill: "#7c2d12", fontSize: 12 }} />
+            <PolarAngleAxis dataKey="axis" tick={{ fill: "var(--radar-tick-color)", fontSize: 12 }} />
             <Radar
               dataKey="value"
               fill="#fbbf24"
@@ -155,11 +157,11 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
         >
           {handlePoints.map((point, index) => (
             <g key={PERSONA_AXES[index].key}>
-              <circle cx={point.x} cy={point.y} r={11} fill="#7c2d12" fillOpacity={0.12} />
+              <circle cx={point.x} cy={point.y} r={HANDLE_HALO_RADIUS} fill="#7c2d12" fillOpacity={0.12} />
               <circle
                 cx={point.x}
                 cy={point.y}
-                r={8}
+                r={HANDLE_RADIUS}
                 fill="#f97316"
                 stroke="#fff"
                 strokeWidth={2}

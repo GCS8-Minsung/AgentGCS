@@ -5,7 +5,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=(".env", "Backend/.env"), env_file_encoding="utf-8"
+    )
 
     app_name: str = "AgentGCS Backend"
     api_prefix: str = "/api"
@@ -20,6 +22,7 @@ class Settings(BaseSettings):
     anthropic_auth_token: str | None = None
     claude_model: str | None = None
     school_api_token: str | None = None
+    google_oauth_access_token: str | None = None
 
     notebooklm_cli_path: str = "notebooklm-mcp-cli"
     notebooklm_output_dir: str = "./outputs"

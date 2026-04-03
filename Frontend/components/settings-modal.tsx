@@ -20,6 +20,7 @@ import {
 type ConnectionSnapshot = {
   claude: ClaudeConnectionStatus;
   school_api: { token_saved: boolean };
+  google_workspace: { token_saved: boolean };
 };
 
 type Props = {
@@ -42,6 +43,41 @@ const EMPTY_STATS: PersonaStats = {
   data_dependency: 71,
   empathy: 48,
   drive: 84
+};
+
+const GOOGLE_CLIENT_ID =
+  process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ??
+  "513803184584-7sb5sp4qv68a534kvd0u3inp0ruf021r.apps.googleusercontent.com";
+
+const GOOGLE_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/drive.file"
+].join(" ");
+
+type GoogleTokenResponse = {
+  access_token?: string;
+  expires_in?: number;
+  scope?: string;
+  error?: string;
+};
+
+type GoogleWindow = Window & {
+  google?: {
+    accounts?: {
+      oauth2?: {
+        initTokenClient: (config: {
+          client_id: string;
+          scope: string;
+          ux_mode?: "popup" | "redirect";
+          callback: (response: GoogleTokenResponse) => void;
+          error_callback?: (response: { message?: string; type?: string }) => void;
+        }) => {
+          requestAccessToken: (params?: { prompt?: string }) => void;
+        };
+      };
+    };
+  };
 };
 
 function checkboxRow(
@@ -77,25 +113,67 @@ export const SettingsModal = memo(function SettingsModal({
   const [saving, setSaving] = useState(false);
   const [savingKey, setSavingKey] = useState(false);
   const [schoolApiToken, setSchoolApiToken] = useState("");
+  const [googleReady, setGoogleReady] = useState(false);
+  const [googleConnecting, setGoogleConnecting] = useState(false);
   const [statusText, setStatusText] = useState<string | null>(null);
   const [draftSettings, setDraftSettings] = useState<UserSettings>(settings);
   const [showRadar, setShowRadar] = useState(false);
+  const [localSavedKeyNames, setLocalSavedKeyNames] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
     setDraftSettings(settings);
     setStatusText(null);
-  }, [open, settings]);
+    setLocalSavedKeyNames([]);
+    try {
+      const raw = localStorage.getItem(`agentgcs_saved_keys_${userId}`);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setLocalSavedKeyNames(parsed.filter((item): item is string => typeof item === "string"));
+      }
+    } catch {
+      setLocalSavedKeyNames([]);
+    }
+  }, [open, settings, userId]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const requestedTheme = open ? draftSettings.theme : settings.theme;
+    const resolved = requestedTheme === "system" ? (media.matches ? "dark" : "light") : requestedTheme;
+    document.documentElement.classList.toggle("dark", resolved === "dark");
+  }, [draftSettings.theme, open, settings.theme]);
 
   useEffect(() => {
     if (!open) {
       setShowRadar(false);
+      setGoogleReady(false);
       return;
     }
     const timer = window.setTimeout(() => {
       setShowRadar(true);
     }, 0);
     return () => window.clearTimeout(timer);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const googleWindow = window as GoogleWindow;
+    if (googleWindow.google?.accounts?.oauth2) {
+      setGoogleReady(true);
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => setGoogleReady(true);
+    script.onerror = () => setGoogleReady(false);
+    document.head.appendChild(script);
+    return () => {
+      script.remove();
+    };
   }, [open]);
 
   const activePersona = useMemo(() => {
@@ -120,27 +198,46 @@ export const SettingsModal = memo(function SettingsModal({
   }
 
   function addPersona() {
-    const newPersona: PersonaProfile = {
-      id: crypto.randomUUID(),
-      name: `새 페르소나 ${draftSettings.personas.length + 1}`,
-      stats: { ...EMPTY_STATS }
-    };
-    setDraftSettings({
-      ...draftSettings,
-      personas: [...draftSettings.personas, newPersona],
-      active_persona_id: newPersona.id
+    setDraftSettings((current) => {
+      const newPersona: PersonaProfile = {
+        id: crypto.randomUUID(),
+        name: `새 페르소나 ${current.personas.length + 1}`,
+        stats: { ...EMPTY_STATS }
+      };
+      return {
+        ...current,
+        personas: [...current.personas, newPersona],
+        active_persona_id: newPersona.id
+      };
     });
   }
 
   function removePersona(personaId: string) {
-    if (draftSettings.personas.length <= 1) return;
-    const filtered = draftSettings.personas.filter((persona) => persona.id !== personaId);
-    setDraftSettings({
-      ...draftSettings,
-      personas: filtered,
-      active_persona_id: filtered[0]?.id ?? null
+    setDraftSettings((current) => {
+      if (current.personas.length <= 1) return current;
+      const filtered = current.personas.filter((persona) => persona.id !== personaId);
+      return {
+        ...current,
+        personas: filtered,
+        active_persona_id: filtered[0]?.id ?? null
+      };
     });
   }
+
+  const rememberSavedKey = useCallback(
+    (keyName: string) => {
+      setLocalSavedKeyNames((current) => {
+        const next = Array.from(new Set([...current, keyName]));
+        try {
+          localStorage.setItem(`agentgcs_saved_keys_${userId}`, JSON.stringify(next));
+        } catch {
+          // ignore local storage errors
+        }
+        return next;
+      });
+    },
+    [userId]
+  );
 
   async function handleSaveSettings() {
     setSaving(true);
@@ -161,6 +258,7 @@ export const SettingsModal = memo(function SettingsModal({
     setStatusText(null);
     try {
       await onSaveApiKey("school_api_token", schoolApiToken.trim());
+      rememberSavedKey("school_api_token");
       setSchoolApiToken("");
       setStatusText("api.1000.school 토큰이 저장되었습니다.");
       await onRefreshConnectionStatus();
@@ -171,7 +269,98 @@ export const SettingsModal = memo(function SettingsModal({
     }
   }
 
-  const keyNames = apiKeys.map((key) => key.key_name);
+  const keyNames = useMemo(() => {
+    const names = new Set(apiKeys.map((key) => key.key_name));
+    for (const keyName of localSavedKeyNames) {
+      names.add(keyName);
+    }
+    if (connectionStatus?.school_api.token_saved) names.add("school_api_token");
+    if (connectionStatus?.google_workspace.token_saved) names.add("google_oauth_access_token");
+    return Array.from(names);
+  }, [
+    apiKeys,
+    connectionStatus?.google_workspace.token_saved,
+    connectionStatus?.school_api.token_saved,
+    localSavedKeyNames
+  ]);
+  const hasGoogleToken =
+    keyNames.includes("google_oauth_access_token") ||
+    Boolean(connectionStatus?.google_workspace.token_saved);
+  const updateApprovalPolicy = useCallback(
+    (patch: Partial<UserSettings["approval_policy"]>) => {
+      setDraftSettings((current) => ({
+        ...current,
+        approval_policy: {
+          ...current.approval_policy,
+          ...patch
+        }
+      }));
+    },
+    []
+  );
+
+  const connectGoogleWorkspace = useCallback(async () => {
+    const googleWindow = window as GoogleWindow;
+    if (!googleWindow.google?.accounts?.oauth2) {
+      setStatusText("Google OAuth 스크립트가 준비되지 않았습니다. 잠시 후 다시 시도해주세요.");
+      return;
+    }
+
+    setGoogleConnecting(true);
+    setStatusText(null);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tokenClient = googleWindow.google?.accounts?.oauth2?.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: GOOGLE_SCOPES,
+          ux_mode: "popup",
+          callback: (response) => {
+            if (response.error || !response.access_token) {
+              reject(new Error(response.error ?? "Google OAuth 토큰 발급 실패"));
+              return;
+            }
+            void (async () => {
+              await onSaveApiKey("google_oauth_access_token", response.access_token as string);
+              rememberSavedKey("google_oauth_access_token");
+              const meta = JSON.stringify({
+                issued_at: new Date().toISOString(),
+                expires_in: response.expires_in ?? null,
+                scope: response.scope ?? GOOGLE_SCOPES
+              });
+              await onSaveApiKey("google_oauth_token_meta", meta);
+              rememberSavedKey("google_oauth_token_meta");
+              resolve();
+            })().catch(reject);
+          },
+          error_callback: (error) =>
+            reject(new Error(error.message || error.type || "Google OAuth 초기화 실패"))
+        });
+
+        tokenClient?.requestAccessToken({ prompt: hasGoogleToken ? "" : "consent" });
+      });
+
+      await onRefreshConnectionStatus();
+      setStatusText("Google Workspace OAuth 토큰이 저장되었습니다.");
+    } catch (error) {
+      const message = (error as Error).message;
+      if (message.includes("redirect_uri_mismatch") || message.includes("origin_mismatch")) {
+        const origin = window.location.origin;
+        const callback = `${origin}/oauth/google/callback`;
+        const localhostHint =
+          window.location.hostname === "localhost"
+            ? " (로컬 테스트 시 `http://127.0.0.1:3000` 도 함께 등록 권장)"
+            : "";
+        setStatusText(
+          `Google OAuth 400: redirect_uri_mismatch/origin_mismatch. Google Cloud Console의 OAuth 클라이언트(${GOOGLE_CLIENT_ID})에 Authorized JavaScript origins=${origin}, Authorized redirect URIs=${callback} 를 등록 후 다시 시도해주세요.${localhostHint}`
+        );
+      } else {
+        setStatusText(message);
+      }
+    } finally {
+      setGoogleConnecting(false);
+    }
+  }, [hasGoogleToken, onRefreshConnectionStatus, onSaveApiKey, rememberSavedKey]);
 
   if (!open) return null;
 
@@ -209,7 +398,10 @@ export const SettingsModal = memo(function SettingsModal({
 
             <Card className="space-y-3">
               <CardTitle>API 연결</CardTitle>
-              <CardDescription>교내 토큰은 Claude 연결에도 동일 토큰으로 사용됩니다.</CardDescription>
+              <CardDescription>
+                교내 토큰은 Claude 연결에도 동일 토큰으로 사용됩니다. Google OAuth 연결 시
+                Gmail/Calendar/Drive API가 활성화됩니다.
+              </CardDescription>
               <Input
                 value={schoolApiToken}
                 onChange={(event) => setSchoolApiToken(event.target.value)}
@@ -234,6 +426,23 @@ export const SettingsModal = memo(function SettingsModal({
                   연결 진단 갱신
                 </Button>
               </div>
+              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/70 bg-white/50 p-3">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={!googleReady || googleConnecting}
+                  onClick={() => void connectGoogleWorkspace()}
+                >
+                  {googleConnecting
+                    ? "Google OAuth 연결 중..."
+                    : hasGoogleToken
+                      ? "Google OAuth 재연결"
+                      : "Google OAuth 연결"}
+                </Button>
+                <span className="text-xs text-orange-900/75">
+                  {hasGoogleToken ? "연결됨" : googleReady ? "미연결" : "스크립트 로딩 중"}
+                </span>
+              </div>
               <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80">
                 저장된 키: {keyNames.length > 0 ? keyNames.join(", ") : "없음"}
               </div>
@@ -241,59 +450,37 @@ export const SettingsModal = memo(function SettingsModal({
                 Claude 상태: {connectionStatus?.claude.status ?? "unknown"} /{" "}
                 {connectionStatus?.claude.reachable ? "reachable" : "not reachable"}
               </div>
+              <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80">
+                Google Workspace: {connectionStatus?.google_workspace.token_saved ? "connected" : "not connected"}
+              </div>
             </Card>
 
             <Card className="space-y-3">
               <CardTitle>AI 승인 정책</CardTitle>
-              <CardDescription>실행 모드별 사용자 승인 요구 여부를 설정합니다.</CardDescription>
+              <CardDescription>
+                완전자율은 최초 1회 승인 후 자동 진행됩니다. 나머지 모드는 외부 API 같은 위험 작업에서만
+                승인 정책을 적용합니다.
+              </CardDescription>
               <div className="space-y-2">
                 {checkboxRow(
-                  "신중함 모드 실행 전 승인",
+                  "신중함 모드 위험 작업 승인",
                   draftSettings.approval_policy.cautious_requires_approval,
-                  (next) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      approval_policy: {
-                        ...draftSettings.approval_policy,
-                        cautious_requires_approval: next
-                      }
-                    })
+                  (next) => updateApprovalPolicy({ cautious_requires_approval: next })
                 )}
                 {checkboxRow(
-                  "균형형 모드 실행 전 승인",
+                  "균형형 모드 위험 작업 승인",
                   draftSettings.approval_policy.balanced_requires_approval,
-                  (next) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      approval_policy: {
-                        ...draftSettings.approval_policy,
-                        balanced_requires_approval: next
-                      }
-                    })
+                  (next) => updateApprovalPolicy({ balanced_requires_approval: next })
                 )}
                 {checkboxRow(
-                  "창의적 모드 실행 전 승인",
+                  "창의적 모드 위험 작업 승인",
                   draftSettings.approval_policy.creative_requires_approval,
-                  (next) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      approval_policy: {
-                        ...draftSettings.approval_policy,
-                        creative_requires_approval: next
-                      }
-                    })
+                  (next) => updateApprovalPolicy({ creative_requires_approval: next })
                 )}
                 {checkboxRow(
                   "완전자율 최초 경고/승인 필요",
                   draftSettings.approval_policy.autonomous_needs_first_warning,
-                  (next) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      approval_policy: {
-                        ...draftSettings.approval_policy,
-                        autonomous_needs_first_warning: next
-                      }
-                    })
+                  (next) => updateApprovalPolicy({ autonomous_needs_first_warning: next })
                 )}
               </div>
               <p className="rounded-xl border border-amber-200/80 bg-amber-50/70 px-3 py-2 text-xs text-amber-900/80">
@@ -327,7 +514,9 @@ export const SettingsModal = memo(function SettingsModal({
                     <button
                       type="button"
                       className="w-full text-left"
-                      onClick={() => setDraftSettings({ ...draftSettings, active_persona_id: persona.id })}
+                      onClick={() =>
+                        setDraftSettings((current) => ({ ...current, active_persona_id: persona.id }))
+                      }
                     >
                       <p className="text-sm font-semibold text-gray-800">{persona.name}</p>
                       <p className="text-xs text-orange-900/65">{persona.id}</p>

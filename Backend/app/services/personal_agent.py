@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.claude_service import ClaudeService
+from app.services.integrations import (
+    create_google_calendar_event,
+    send_gmail_notification,
+    upload_to_google_drive,
+)
 from app.services.school_api_client import SchoolApiError, get_school_client_for_user
 from app.services.websocket_manager import WebSocketManager
 
@@ -46,10 +51,13 @@ class PersonalAgentService:
         Supported actions:
         - list_meeting_rooms
         - create_meeting_reservation
+        - create_calendar_event
+        - send_gmail
+        - upload_drive_file
         """
-        client = await get_school_client_for_user(user_id)
         try:
             if action == "list_meeting_rooms":
+                client = await get_school_client_for_user(user_id)
                 rooms = await client.list_meeting_rooms()
                 await self.ws_manager.emit(
                     user_id,
@@ -59,6 +67,7 @@ class PersonalAgentService:
                 return {"items": rooms}
 
             if action == "create_meeting_reservation":
+                client = await get_school_client_for_user(user_id)
                 result = await client.create_room_reservation(
                     room_id=int(payload["room_id"]),
                     start_at=str(payload["start_at"]),
@@ -74,7 +83,63 @@ class PersonalAgentService:
                     },
                 )
                 return {"item": result}
+
+            if action == "create_calendar_event":
+                result = await create_google_calendar_event(
+                    user_id=user_id,
+                    summary=str(payload["summary"]),
+                    start_at=str(payload["start_at"]),
+                    end_at=str(payload["end_at"]),
+                    description=payload.get("description"),
+                    calendar_id=str(payload.get("calendar_id", "primary")),
+                )
+                await self.ws_manager.emit(
+                    user_id,
+                    "toast.notification",
+                    {
+                        "title": "캘린더 일정 처리",
+                        "description": f"Google Calendar 일정 처리 상태: {result.get('status')}",
+                        "meta": result,
+                    },
+                )
+                return {"item": result}
+
+            if action == "send_gmail":
+                result = await send_gmail_notification(
+                    user_id=user_id,
+                    to_email=str(payload["to_email"]),
+                    subject=str(payload["subject"]),
+                    body=str(payload["body"]),
+                )
+                await self.ws_manager.emit(
+                    user_id,
+                    "toast.notification",
+                    {
+                        "title": "메일 발송 처리",
+                        "description": f"Gmail 발송 상태: {result.get('status')}",
+                        "meta": result,
+                    },
+                )
+                return {"item": result}
+
+            if action == "upload_drive_file":
+                result = await upload_to_google_drive(
+                    file_path=str(payload["file_path"]),
+                    user_id=user_id,
+                )
+                await self.ws_manager.emit(
+                    user_id,
+                    "toast.notification",
+                    {
+                        "title": "드라이브 업로드 처리",
+                        "description": f"Google Drive 업로드 상태: {result.get('status')}",
+                        "meta": result,
+                    },
+                )
+                return {"item": result}
         except SchoolApiError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:
             return {"error": str(exc)}
 
         return {"error": f"Unsupported action: {action}"}

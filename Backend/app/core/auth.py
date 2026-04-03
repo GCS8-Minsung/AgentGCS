@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import Header, HTTPException, status
 
@@ -15,5 +16,11 @@ async def get_current_user_id(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing x-user-id header.",
         )
+    try:
+        UUID(x_user_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid x-user-id. UUID format is required.",
+        ) from exc
     return x_user_id
-

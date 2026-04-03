@@ -44,9 +44,11 @@ import {
 } from "@/lib/api";
 import {
   AgentEvent,
+  ApiKeyMeta,
   AutonomyMode,
   ConversationMessage,
   PersonaStats,
+  WorkspaceConnectionStatus,
   UserSettings
 } from "@/lib/types";
 
@@ -144,6 +146,19 @@ function toConsoleMessages(items: ConversationMessage[]): ConsoleMessage[] {
   }));
 }
 
+function mergeApiKeys(current: ApiKeyMeta[], incoming: ApiKeyMeta[]): ApiKeyMeta[] {
+  const merged = new Map<string, ApiKeyMeta>();
+  for (const item of current) {
+    if (!item.key_name) continue;
+    merged.set(item.key_name, item);
+  }
+  for (const item of incoming) {
+    if (!item.key_name) continue;
+    merged.set(item.key_name, item);
+  }
+  return Array.from(merged.values()).sort((a, b) => a.key_name.localeCompare(b.key_name));
+}
+
 function modeLabel(mode: AutonomyMode): string {
   if (mode === "cautious") return "신중함";
   if (mode === "creative") return "창의적";
@@ -156,19 +171,10 @@ export default function HomePage() {
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [forceKeySetup, setForceKeySetup] = useState(false);
-  const [apiKeys, setApiKeys] = useState<Array<{ id: string; key_name: string; key_version: number }>>([]);
-  const [connectionStatus, setConnectionStatus] = useState<{
-    claude: {
-      configured: boolean;
-      base_url?: string | null;
-      has_auth_token: boolean;
-      has_api_key: boolean;
-      reachable: boolean;
-      status: string;
-      attempts: Array<Record<string, unknown>>;
-    };
-    school_api: { token_saved: boolean };
-  } | null>(null);
+  const [apiKeys, setApiKeys] = useState<ApiKeyMeta[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<WorkspaceConnectionStatus | null>(
+    null
+  );
 
   const [messages, setMessages] = useState<ConsoleMessage[]>([]);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -190,6 +196,7 @@ export default function HomePage() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
 
   const activePersona = useMemo(() => {
     const target = settings.personas.find((persona) => persona.id === settings.active_persona_id);
@@ -199,6 +206,13 @@ export default function HomePage() {
   const streamBadge = useMemo(
     () => (socketConnected ? "실시간 연결됨" : "실시간 연결 끊김"),
     [socketConnected]
+  );
+  const hasSchoolApiToken = useMemo(
+    () =>
+      settings.dev_mode ||
+      Boolean(connectionStatus?.school_api.token_saved) ||
+      apiKeys.some((item) => item.key_name === "school_api_token"),
+    [apiKeys, connectionStatus?.school_api.token_saved, settings.dev_mode]
   );
 
   const userId = session?.userId ?? "";
@@ -216,6 +230,15 @@ export default function HomePage() {
       )),
     [messages]
   );
+
+  useEffect(() => {
+    const container = messageListRef.current;
+    if (!container) return;
+    const rafId = window.requestAnimationFrame(() => {
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [messages]);
 
   const appendAssistantMessage = useCallback((content: string) => {
     setMessages((current) => {
@@ -264,25 +287,32 @@ export default function HomePage() {
 
   const refreshConnectionStatus = useCallback(async () => {
     if (!userId) return;
+    const localHasSchoolToken = apiKeys.some((item) => item.key_name === "school_api_token");
     try {
       const response = await fetchConnectionStatus(userId);
       setConnectionStatus(response);
+      setForceKeySetup(!response.school_api.token_saved && !localHasSchoolToken && !settings.dev_mode);
     } catch {
       setConnectionStatus(null);
+      setForceKeySetup(!localHasSchoolToken && !settings.dev_mode);
     }
-  }, [userId]);
+  }, [apiKeys, settings.dev_mode, userId]);
 
   const refreshKeys = useCallback(async () => {
     if (!userId) return [];
     try {
       const response = await listUserKeys(userId);
-      setApiKeys(response.items ?? []);
-      return response.items ?? [];
+      const incoming = response.items ?? [];
+      let merged: ApiKeyMeta[] = [];
+      setApiKeys((current) => {
+        merged = mergeApiKeys(current, incoming);
+        return merged;
+      });
+      return merged;
     } catch {
-      setApiKeys([]);
-      return [];
+      return apiKeys;
     }
-  }, [userId]);
+  }, [apiKeys, userId]);
 
   const openConversation = useCallback(
     async (threadId: string) => {
@@ -350,12 +380,10 @@ export default function HomePage() {
           setMessages([]);
         }
 
-        if ((keysResponse.items ?? []).length === 0 && !nextSettings.dev_mode) {
-          setForceKeySetup(true);
-          setSettingsOpen(true);
-        } else {
-          setForceKeySetup(false);
-        }
+        const hasSchoolKey = (keysResponse.items ?? []).some(
+          (item) => item.key_name === "school_api_token"
+        );
+        setForceKeySetup(!hasSchoolKey && !nextSettings.dev_mode);
       } catch (error) {
         if (!cancelled) {
           setWorkspaceError((error as Error).message);
@@ -436,43 +464,57 @@ export default function HomePage() {
     return () => media.removeEventListener("change", applyTheme);
   }, [settings.theme]);
 
+  useEffect(() => {
+    if (settings.dev_mode) {
+      setForceKeySetup(false);
+      return;
+    }
+    if (apiKeys.some((item) => item.key_name === "school_api_token")) {
+      setForceKeySetup(false);
+    }
+  }, [apiKeys, settings.dev_mode]);
+
   const maybeRequireApproval = useCallback(
-    async (mode: AutonomyMode): Promise<boolean> => {
-      if (mode === "cautious" && settings.approval_policy.cautious_requires_approval) {
-        return window.confirm("신중함 모드 실행 전 사용자 승인이 필요합니다. 계속할까요?");
-      }
-      if (mode === "balanced" && settings.approval_policy.balanced_requires_approval) {
-        return window.confirm("균형형 모드 실행 전 사용자 승인이 필요합니다. 계속할까요?");
-      }
-      if (mode === "creative" && settings.approval_policy.creative_requires_approval) {
-        return window.confirm("창의적 모드 실행 전 사용자 승인이 필요합니다. 계속할까요?");
-      }
+    async (mode: AutonomyMode, riskyAction: boolean): Promise<boolean> => {
       if (
         mode === "autonomous" &&
         settings.approval_policy.autonomous_needs_first_warning &&
         !settings.approval_policy.autonomous_warning_accepted
       ) {
         const approved = window.confirm(
-          "완전자율 모드는 최초 1회 경고 후 자동 진행됩니다. 승인하면 이후 동일 세션에서 추가 승인 없이 진행합니다. 계속할까요?"
+          "완전자율 모드는 최초 1회 승인 이후 모든 작업을 자동으로 진행합니다. 계속할까요?"
         );
-        if (approved) {
-          const next: UserSettings = {
-            ...settings,
-            approval_policy: {
-              ...settings.approval_policy,
-              autonomous_warning_accepted: true
-            }
-          };
-          setSettings(next);
-          if (userId) {
-            try {
-              await saveWorkspaceSettings(userId, next);
-            } catch {
-              // ignore temporary persistence failure
-            }
+        if (!approved) return false;
+
+        const next: UserSettings = {
+          ...settings,
+          approval_policy: {
+            ...settings.approval_policy,
+            autonomous_warning_accepted: true
+          }
+        };
+        setSettings(next);
+        if (userId) {
+          try {
+            await saveWorkspaceSettings(userId, next);
+          } catch {
+            // ignore temporary persistence failure
           }
         }
-        return approved;
+        return true;
+      }
+
+      if (!riskyAction) return true;
+      if (mode === "autonomous") return true;
+
+      if (mode === "cautious" && settings.approval_policy.cautious_requires_approval) {
+        return window.confirm("신중함 모드의 외부 API 작업을 실행할까요?");
+      }
+      if (mode === "balanced" && settings.approval_policy.balanced_requires_approval) {
+        return window.confirm("균형형 모드의 외부 API 작업을 실행할까요?");
+      }
+      if (mode === "creative" && settings.approval_policy.creative_requires_approval) {
+        return window.confirm("창의적 모드의 외부 API 작업을 실행할까요?");
       }
       return true;
     },
@@ -482,7 +524,12 @@ export default function HomePage() {
   const handleChatSend = useCallback(
     async (text: string, mode: AutonomyMode) => {
       if (!userId || !settings) return;
-      const approved = await maybeRequireApproval(mode);
+      if (!hasSchoolApiToken) {
+        appendAssistantMessage("API 키를 입력하세요. `api.1000.school` 토큰 저장 후 대화를 시작할 수 있습니다.");
+        setSettingsOpen(true);
+        return;
+      }
+      const approved = await maybeRequireApproval(mode, false);
       if (!approved) return;
 
       setActiveView("multi_agent");
@@ -541,6 +588,7 @@ export default function HomePage() {
       activePersona?.stats,
       appendAssistantMessage,
       connectionStatus?.claude.reachable,
+      hasSchoolApiToken,
       maybeRequireApproval,
       refreshConversations,
       settings,
@@ -576,10 +624,20 @@ export default function HomePage() {
 
   const handleSaveApiKey = useCallback(async (keyName: string, plaintextKey: string) => {
     if (!userId) return;
-    await storeUserKey(userId, { key_name: keyName, plaintext_key: plaintextKey });
-    const keys = await refreshKeys();
-    setForceKeySetup(keys.length === 0 && !settings.dev_mode);
-  }, [refreshKeys, settings.dev_mode, userId]);
+    const response = await storeUserKey(userId, { key_name: keyName, plaintext_key: plaintextKey });
+    setApiKeys((current) =>
+      mergeApiKeys(current, [
+        {
+          id: `local-${response.key_name}`,
+          key_name: response.key_name,
+          key_version: 1,
+          updated_at: new Date().toISOString()
+        }
+      ])
+    );
+    await refreshKeys();
+    await refreshConnectionStatus();
+  }, [refreshConnectionStatus, refreshKeys, userId]);
 
   async function handleStartDeepTask() {
     if (!userId) return;
@@ -597,7 +655,13 @@ export default function HomePage() {
       return;
     }
 
-    const approved = await maybeRequireApproval(taskMode);
+    if (!hasSchoolApiToken) {
+      appendAssistantMessage("API 키를 입력하세요. `api.1000.school` 토큰이 없으면 과제 자동화를 시작할 수 없습니다.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    const approved = await maybeRequireApproval(taskMode, true);
     if (!approved) return;
 
     setRunning(true);
@@ -649,9 +713,8 @@ export default function HomePage() {
   ];
 
   const handleCloseSettings = useCallback(() => {
-    if (forceKeySetup && !settings.dev_mode && apiKeys.length === 0) return;
     setSettingsOpen(false);
-  }, [apiKeys.length, forceKeySetup, settings.dev_mode]);
+  }, []);
 
   if (!session) {
     return <LoginGate onAuthenticated={(next) => setSession(next)} />;
@@ -676,9 +739,9 @@ export default function HomePage() {
 
       {!settingsOpen && (
         <>
-          <div className="pointer-events-none absolute left-[-10%] top-[-10%] h-[40%] w-[40%] rounded-full bg-orange-200/25 blur-[60px]" />
-          <div className="pointer-events-none absolute bottom-[-10%] right-[-5%] h-[50%] w-[50%] rounded-full bg-amber-100/35 blur-[70px]" />
-          <div className="pointer-events-none absolute right-[10%] top-[20%] h-[30%] w-[30%] rounded-full bg-white/50 blur-[50px]" />
+          <div className="pointer-events-none absolute left-[-10%] top-[-10%] h-[40%] w-[40%] rounded-full bg-orange-200/25 blur-[30px]" />
+          <div className="pointer-events-none absolute bottom-[-10%] right-[-5%] h-[50%] w-[50%] rounded-full bg-amber-100/35 blur-[35px]" />
+          <div className="pointer-events-none absolute right-[10%] top-[20%] h-[30%] w-[30%] rounded-full bg-white/50 blur-[25px]" />
 
           <ChatSidebar
             items={sidebarItems}
@@ -745,7 +808,10 @@ export default function HomePage() {
             <div className="glass-panel flex min-h-0 flex-col rounded-3xl">
               {messages.length > 0 && (
                 <PerfTrace id="chat-message-list" thresholdMs={8}>
-                  <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-6 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-orange-300/35 [&::-webkit-scrollbar-track]:bg-transparent">
+                  <div
+                    ref={messageListRef}
+                    className="min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-6 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-orange-300/35 [&::-webkit-scrollbar-track]:bg-transparent"
+                  >
                     {renderedMessages}
                   </div>
                 </PerfTrace>
@@ -755,21 +821,36 @@ export default function HomePage() {
                 className="flex w-full flex-col items-center justify-center pb-6 pt-2"
                 style={{ flex: messages.length > 0 ? "0 0 auto" : "1 1 auto" }}
               >
-                <div className={messages.length === 0 ? "mb-8" : "mb-4"}>
-                  <PerfTrace id="ai-indicator" thresholdMs={6}>
-                    <AIIndicator
-                      isActive={chatLoading || running}
-                      isChatStarted={messages.length > 0}
-                      onOptionSelect={handleQuickOptionSelect}
-                    />
-                  </PerfTrace>
-                </div>
+                {loadingWorkspace ? (
+                  <div className={messages.length === 0 ? "mb-8" : "mb-4"}>
+                    <p className="rounded-2xl border border-white/70 bg-white/70 px-4 py-2 text-sm text-orange-900/75 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-200">
+                      워크스페이스 동기화 중...
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className={messages.length === 0 ? "mb-8" : "mb-4"}>
+                      <PerfTrace id="ai-indicator" thresholdMs={6}>
+                        <AIIndicator
+                          isActive={chatLoading || running}
+                          isChatStarted={messages.length > 0}
+                          onOptionSelect={handleQuickOptionSelect}
+                        />
+                      </PerfTrace>
+                    </div>
 
-                <ChatInput
-                  onSend={handleChatInputSend}
-                  isCenter={messages.length === 0}
-                  disabled={chatLoading || loadingWorkspace}
-                />
+                    <ChatInput
+                      onSend={handleChatInputSend}
+                      isCenter={messages.length === 0}
+                      disabled={chatLoading || loadingWorkspace || !hasSchoolApiToken}
+                    />
+                  </>
+                )}
+                {!hasSchoolApiToken && (
+                  <p className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/85">
+                    API 키를 입력하세요. 설정에서 `api.1000.school` 토큰을 저장하면 AI 대화 입력창이 활성화됩니다.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -787,6 +868,11 @@ export default function HomePage() {
                     {connectionStatus?.school_api.token_saved
                       ? "School 토큰 저장됨"
                       : "School 토큰 없음"}
+                  </Badge>
+                  <Badge>
+                    {connectionStatus?.google_workspace.token_saved
+                      ? "Google OAuth 연결됨"
+                      : "Google OAuth 미연결"}
                   </Badge>
                   <Badge>{settings.dev_mode ? "DB 우회 테스트 가능" : "DB 연결 사용"}</Badge>
                 </div>
@@ -858,7 +944,10 @@ export default function HomePage() {
                   )}
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button onClick={() => void handleStartDeepTask()} disabled={running}>
+                  <Button
+                    onClick={() => void handleStartDeepTask()}
+                    disabled={running || !hasSchoolApiToken}
+                  >
                     {running ? "실행 중..." : "과제 토론 시작"}
                   </Button>
                   <Button
@@ -873,6 +962,11 @@ export default function HomePage() {
                 {activeRunId && (
                   <p className="rounded-xl bg-white/70 px-3 py-2 font-mono text-xs text-orange-900/80">
                     run_id: {activeRunId}
+                  </p>
+                )}
+                {!hasSchoolApiToken && (
+                  <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/85">
+                    API 키를 입력하세요. `api.1000.school` 토큰이 없으면 과제 자동화 API가 비활성화됩니다.
                   </p>
                 )}
               </Card>

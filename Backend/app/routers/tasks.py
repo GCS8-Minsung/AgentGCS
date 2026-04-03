@@ -25,10 +25,15 @@ async def list_tasks(user_id: str = Depends(get_current_user_id)) -> dict:
 
     try:
         result = await asyncio.to_thread(_select)
-        return {"items": result.data or [], "source": "supabase"}
+        rows = result.data or []
+        if rows:
+            return {"items": rows, "source": "supabase"}
     except Exception:
-        items = await dev_store.list_tasks(user_id)
-        return {"items": items, "source": "dev_store"}
+        pass
+
+    items = await dev_store.list_tasks(user_id)
+    source = "dev_store" if items else "supabase"
+    return {"items": items, "source": source}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

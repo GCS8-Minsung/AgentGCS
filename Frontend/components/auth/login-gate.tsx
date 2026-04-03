@@ -1,13 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { FlaskConical, KeyRound } from "lucide-react";
+import { useEffect, useState } from "react";
+import { FlaskConical, KeyRound, LogIn } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
+import { hasSupabaseEnv, supabase } from "@/lib/supabase";
 
-const DEFAULT_CLIENT_ID =
-  "513803184584-7sb5sp4qv68a534kvd0u3inp0ruf021r.apps.googleusercontent.com";
 const AUTH_STORAGE_KEY = "agentgcs_auth_session";
 
 type AuthSession = {
@@ -22,133 +21,97 @@ type Props = {
   onAuthenticated: (session: AuthSession) => void;
 };
 
-declare global {
-  interface Window {
-    google?: {
-      accounts: {
-        id: {
-          initialize: (config: Record<string, unknown>) => void;
-          renderButton: (parent: HTMLElement, options: Record<string, unknown>) => void;
-          prompt: () => void;
-        };
-      };
-    };
-  }
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const parts = token.split(".");
-  if (parts.length < 2) return null;
-  try {
-    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const decoded = atob(payload.padEnd(payload.length + ((4 - (payload.length % 4)) % 4), "="));
-    return JSON.parse(decoded) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function deterministicUuidFromString(seed: string): string {
-  const bytes = new Uint8Array(16);
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  for (let i = 0; i < seed.length; i += 1) {
-    const code = seed.charCodeAt(i);
-    h1 ^= code;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= code + i;
-    h2 = Math.imul(h2, 0x01000195);
-  }
-  for (let i = 0; i < 16; i += 1) {
-    const source = i % 2 === 0 ? h1 : h2;
-    bytes[i] = (source >> ((i % 4) * 8)) & 0xff;
-    h1 = Math.imul(h1 ^ (i + 17), 0x01000193);
-    h2 = Math.imul(h2 ^ (i + 31), 0x01000195);
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
-    16,
-    20
-  )}-${hex.slice(20, 32)}`;
+function mapSupabaseUserToSession(user: {
+  id: string;
+  email?: string | null;
+  user_metadata?: Record<string, unknown>;
+}): AuthSession {
+  return {
+    userId: user.id,
+    email: user.email ?? null,
+    fullName: typeof user.user_metadata?.full_name === "string" ? user.user_metadata.full_name : null,
+    avatarUrl: typeof user.user_metadata?.avatar_url === "string" ? user.user_metadata.avatar_url : null,
+    provider: "google"
+  };
 }
 
 export function LoginGate({ onAuthenticated }: Props) {
-  const [ready, setReady] = useState(false);
   const [loading, setLoading] = useState(true);
-  const clientId = useMemo(
-    () => process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? DEFAULT_CLIENT_ID,
-    []
-  );
 
   useEffect(() => {
-    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw) as AuthSession;
-        if (parsed.userId) {
-          onAuthenticated(parsed);
+    let mounted = true;
+
+    async function initialize() {
+      if (hasSupabaseEnv && supabase) {
+        const { data } = await supabase.auth.getSession();
+        if (!mounted) return;
+        if (data.session?.user) {
+          const mapped = mapSupabaseUserToSession(data.session.user);
+          localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(mapped));
+          onAuthenticated(mapped);
           return;
         }
-      } catch {
-        localStorage.removeItem(AUTH_STORAGE_KEY);
+      }
+
+      const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+      if (raw && mounted) {
+        try {
+          const parsed = JSON.parse(raw) as AuthSession;
+          const canReuseLocalSession = !hasSupabaseEnv || parsed.provider === "dev";
+          if (parsed.userId && canReuseLocalSession) {
+            onAuthenticated(parsed);
+            return;
+          }
+          if (!canReuseLocalSession) {
+            localStorage.removeItem(AUTH_STORAGE_KEY);
+          }
+        } catch {
+          localStorage.removeItem(AUTH_STORAGE_KEY);
+        }
+      }
+
+      if (mounted) {
+        setLoading(false);
       }
     }
-    setLoading(false);
+
+    void initialize();
+
+    if (!hasSupabaseEnv || !supabase) {
+      return () => {
+        mounted = false;
+      };
+    }
+
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+      if (session?.user) {
+        const mapped = mapSupabaseUserToSession(session.user);
+        localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(mapped));
+        onAuthenticated(mapped);
+      } else {
+        localStorage.removeItem(AUTH_STORAGE_KEY);
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, [onAuthenticated]);
 
-  useEffect(() => {
-    if (loading) return;
-    if (window.google?.accounts?.id) {
-      setReady(true);
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.onload = () => setReady(true);
-    document.head.appendChild(script);
-    return () => {
-      script.remove();
-    };
-  }, [loading]);
-
-  useEffect(() => {
-    if (!ready || loading) return;
-    const container = document.getElementById("google-login-button");
-    if (!container || !window.google?.accounts?.id) return;
-    container.innerHTML = "";
-
-    window.google.accounts.id.initialize({
-      client_id: clientId,
-      callback: (response: { credential?: string }) => {
-        if (!response.credential) return;
-        const payload = decodeJwtPayload(response.credential);
-        const sub = String(payload?.sub ?? crypto.randomUUID());
-        const session: AuthSession = {
-          userId: deterministicUuidFromString(sub),
-          email: typeof payload?.email === "string" ? payload.email : null,
-          fullName: typeof payload?.name === "string" ? payload.name : null,
-          avatarUrl: typeof payload?.picture === "string" ? payload.picture : null,
-          provider: "google"
-        };
-        localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
-        onAuthenticated(session);
+  async function signInWithGoogle() {
+    if (!supabase) return;
+    await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: window.location.origin
       }
     });
-
-    window.google.accounts.id.renderButton(container, {
-      theme: "filled_blue",
-      size: "large",
-      shape: "pill",
-      locale: "ko",
-      width: 280
-    });
-    window.google.accounts.id.prompt();
-  }, [ready, loading, clientId, onAuthenticated]);
+  }
 
   if (loading) {
     return (
@@ -170,7 +133,16 @@ export function LoginGate({ onAuthenticated }: Props) {
 
         <div className="rounded-2xl border border-white/80 bg-white/55 p-4">
           <p className="mb-3 text-sm font-semibold text-gray-800">Google OAuth 2.0 로그인</p>
-          <div id="google-login-button" className="min-h-10" />
+          {hasSupabaseEnv && supabase ? (
+            <Button type="button" variant="accent" className="gap-2" onClick={() => void signInWithGoogle()}>
+              <LogIn className="h-4 w-4" />
+              Google로 로그인
+            </Button>
+          ) : (
+            <p className="text-xs text-orange-900/75">
+              Supabase 환경변수가 없어 Google OAuth 로그인을 시작할 수 없습니다.
+            </p>
+          )}
         </div>
 
         <div className="rounded-2xl border border-amber-200/70 bg-amber-50/70 p-4 text-sm text-amber-900/85">
@@ -203,7 +175,7 @@ export function LoginGate({ onAuthenticated }: Props) {
           </Button>
           <Button type="button" variant="ghost" className="gap-2" disabled>
             <KeyRound className="h-4 w-4" />
-            클라이언트 ID 적용됨
+            {hasSupabaseEnv ? "Supabase OAuth 활성" : "Supabase 키 미설정"}
           </Button>
         </div>
       </Card>
@@ -213,4 +185,7 @@ export function LoginGate({ onAuthenticated }: Props) {
 
 export function clearAuthSession() {
   localStorage.removeItem(AUTH_STORAGE_KEY);
+  if (supabase) {
+    void supabase.auth.signOut();
+  }
 }

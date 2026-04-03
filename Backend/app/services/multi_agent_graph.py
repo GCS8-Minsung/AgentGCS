@@ -132,7 +132,10 @@ class DeepTaskOrchestrator:
                 },
             )
 
-            drive_result = await upload_to_google_drive(notebooklm_result.get("script_path", ""))
+            drive_result = await upload_to_google_drive(
+                file_path=notebooklm_result.get("script_path", ""),
+                user_id=user_id,
+            )
             await stream_hook(
                 "deep_task.drive_uploaded",
                 {
@@ -154,6 +157,7 @@ class DeepTaskOrchestrator:
 
             if request.notify_email:
                 mail_result = await send_gmail_notification(
+                    user_id=user_id,
                     to_email=request.notify_email,
                     subject=f"[AgentGCS] 과제 분석 완료 - {request.task[:40]}",
                     body=final_summary,

@@ -4,6 +4,7 @@
 
 :root {
   --foreground: #4a4a4a;
+  --radar-tick-color: #7c2d12;
 }
 
 html,
@@ -23,6 +24,7 @@ body {
 
 html.dark {
   --foreground: #e5e7eb;
+  --radar-tick-color: #e2e8f0;
 }
 
 html.dark body {
@@ -54,33 +56,111 @@ html.dark .glass-panel {
     inset 0 0 8px rgba(255, 255, 255, 0.04);
 }
 
-@keyframes capsule-loop-move {
+html.dark [class*="text-orange-900"],
+html.dark [class*="text-orange-800"],
+html.dark [class*="text-amber-900"] {
+  color: #e2e8f0 !important;
+}
+
+html.dark [class*="text-orange-700"],
+html.dark [class*="text-orange-600"],
+html.dark [class*="text-amber-800"],
+html.dark [class*="text-amber-700"] {
+  color: #cbd5e1 !important;
+}
+
+.agent-markdown p,
+.agent-markdown ul,
+.agent-markdown ol,
+.agent-markdown pre,
+.agent-markdown blockquote {
+  margin: 0.45rem 0;
+}
+
+.agent-markdown ul,
+.agent-markdown ol {
+  padding-left: 1.15rem;
+}
+
+.agent-markdown pre {
+  overflow-x: auto;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  background: rgba(15, 23, 42, 0.06);
+  padding: 0.65rem 0.75rem;
+}
+
+.agent-markdown code {
+  border-radius: 0.35rem;
+  background: rgba(15, 23, 42, 0.08);
+  padding: 0.1rem 0.35rem;
+  font-size: 0.84em;
+}
+
+.agent-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.agent-markdown blockquote {
+  border-left: 3px solid rgba(245, 158, 11, 0.55);
+  padding-left: 0.75rem;
+  color: rgba(71, 85, 105, 0.95);
+}
+
+.agent-markdown a {
+  color: #0369a1;
+  text-decoration: underline;
+}
+
+html.dark .agent-markdown pre {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(15, 23, 42, 0.55);
+}
+
+html.dark .agent-markdown code {
+  background: rgba(148, 163, 184, 0.2);
+}
+
+html.dark .agent-markdown blockquote {
+  color: rgba(226, 232, 240, 0.92);
+}
+
+html.dark .agent-markdown a {
+  color: #7dd3fc;
+}
+
+@keyframes capsule-flow {
   from {
-    stroke-dashoffset: 110;
+    stroke-dashoffset: 0;
   }
 
   to {
-    stroke-dashoffset: 0;
+    stroke-dashoffset: -100;
   }
 }
 
-.capsule-loop {
-  stroke-dasharray: 9 91;
+.capsule-idle-glow {
+  filter: drop-shadow(0 0 7px rgba(255, 189, 82, 0.55));
+}
+
+.capsule-moving-segment {
+  stroke-dasharray: 24 76;
   stroke-dashoffset: 0;
-  filter: drop-shadow(0 0 4px rgba(255, 179, 0, 0.5));
+  filter: drop-shadow(0 0 7px rgba(255, 189, 82, 0.62));
 }
 
-.capsule-loop-slow {
-  animation: capsule-loop-move 8s linear infinite;
+.capsule-flow-slow {
+  animation: capsule-flow 8s linear infinite;
 }
 
-.capsule-loop-fast {
-  animation: capsule-loop-move 1.3s linear infinite;
+.capsule-flow-fast {
+  animation: capsule-flow 1.35s linear infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .capsule-loop-slow,
-  .capsule-loop-fast {
+  .capsule-flow-slow,
+  .capsule-flow-fast {
     animation: none;
   }
 }

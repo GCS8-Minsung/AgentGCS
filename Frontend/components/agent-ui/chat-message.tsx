@@ -2,6 +2,8 @@
 
 import { memo } from "react";
 import { Sparkles, User } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface ChatMessageProps {
   content: string;
@@ -29,7 +31,7 @@ function ChatMessageComponent({ content, role, timestamp }: ChatMessageProps) {
       )}
 
       <div
-        className="max-w-3xl rounded-3xl px-6 py-4"
+        className="max-w-3xl rounded-3xl px-6 py-4 text-slate-700 dark:text-slate-100"
         style={{
           background: isUser
             ? "linear-gradient(135deg, rgba(255, 193, 7, 0.1), rgba(255, 160, 122, 0.2))"
@@ -38,10 +40,16 @@ function ChatMessageComponent({ content, role, timestamp }: ChatMessageProps) {
           boxShadow: isUser
             ? "0 4px 14px rgba(255, 160, 122, 0.1)"
             : "0 4px 14px rgba(0, 0, 0, 0.04)",
-          color: "#4a4a4a"
+          overflowWrap: "anywhere"
         }}
       >
-        <p className="whitespace-pre-wrap text-sm leading-relaxed">{content}</p>
+        {isUser ? (
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">{content}</p>
+        ) : (
+          <div className="agent-markdown text-sm leading-relaxed">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+          </div>
+        )}
         <p className="mt-2 text-right text-[10px] font-medium opacity-50">
           {timestamp.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
         </p>
