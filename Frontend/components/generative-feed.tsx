@@ -29,7 +29,9 @@ function eventIcon(type: string) {
 
 export function GenerativeFeed({ events, running }: Props) {
   const sorted = useMemo(() => {
-    const recent = events.slice(-80);
+    const recent = events
+      .filter((event) => event.event_type !== "chat.processing")
+      .slice(-80);
     return [...recent].reverse();
   }, [events]);
   return (

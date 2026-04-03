@@ -57,6 +57,7 @@ export type ApprovalPolicy = {
 export type UserSettings = {
   theme: ThemeMode;
   dev_mode: boolean;
+  debug_raw_mode: boolean;
   claude_base_url?: string | null;
   preferred_model?: string | null;
   knowledge_base_prompt?: string | null;

@@ -36,8 +36,8 @@ function PersonaRadarComponent({
   showInputs = true
 }: Props) {
   const center = size / 2;
-  const radius = size * 0.325;
-  const safeRadius = Math.max(30, radius - HANDLE_RADIUS - 2);
+  const baseRadius = size * 0.31;
+  const safeRadius = Math.max(26, baseRadius - HANDLE_RADIUS - 3);
   const svgRef = useRef<SVGSVGElement>(null);
   const valueRef = useRef<PersonaStats>(value);
   const moveRef = useRef<{ x: number; y: number } | null>(null);
@@ -143,7 +143,7 @@ function PersonaRadarComponent({
             data={data}
             cx="50%"
             cy="50%"
-            outerRadius={radius}
+            outerRadius={safeRadius}
             startAngle={90}
             endAngle={-270}
           >
@@ -194,7 +194,10 @@ function PersonaRadarComponent({
       {showInputs && (
         <div className="grid grid-cols-2 gap-2">
           {PERSONA_AXES.map((axis) => (
-            <label key={axis.key} className="space-y-1 text-xs text-orange-900/80">
+            <label
+              key={axis.key}
+              className="space-y-1 text-xs text-orange-900/80 dark:text-slate-200"
+            >
               <span className="font-semibold">{axis.label}</span>
               <Input
                 type="number"

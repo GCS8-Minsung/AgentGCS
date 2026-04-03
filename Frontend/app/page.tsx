@@ -31,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   agentChat,
   bootstrapUser,
+  createConversation,
   fetchConnectionStatus,
   fetchConversationMessages,
   fetchConversations,
@@ -66,6 +67,7 @@ const DEFAULT_STATS: PersonaStats = {
 const DEFAULT_SETTINGS: UserSettings = {
   theme: "system",
   dev_mode: false,
+  debug_raw_mode: false,
   claude_base_url: "https://claude.1000.school",
   preferred_model: "gpt-5.2",
   knowledge_base_prompt: null,
@@ -136,6 +138,26 @@ type ConsoleMessage = {
 };
 
 type WorkspaceView = "multi_agent" | "kanban" | "automation";
+type HealthLevel = "ok" | "warn" | "error";
+
+function resolveHealthLevelClass(level: HealthLevel) {
+  if (level === "ok") {
+    return {
+      dot: "bg-emerald-500",
+      chip: "border-emerald-200/80 bg-emerald-50 text-emerald-800 dark:border-emerald-700/70 dark:bg-emerald-900/25 dark:text-emerald-200"
+    };
+  }
+  if (level === "warn") {
+    return {
+      dot: "bg-amber-400",
+      chip: "border-amber-200/80 bg-amber-50 text-amber-900 dark:border-amber-700/70 dark:bg-amber-900/25 dark:text-amber-200"
+    };
+  }
+  return {
+    dot: "bg-rose-500",
+    chip: "border-rose-200/80 bg-rose-50 text-rose-800 dark:border-rose-700/70 dark:bg-rose-900/25 dark:text-rose-200"
+  };
+}
 
 function resolveWsBase() {
   if (process.env.NEXT_PUBLIC_BACKEND_WS_URL) return process.env.NEXT_PUBLIC_BACKEND_WS_URL;
@@ -161,18 +183,7 @@ function summarizeEvent(event: AgentEvent): string | null {
     return payload.description;
   }
   if (event.event_type === "chat.processing") {
-    const stage = String(payload.stage ?? "processing");
-    if (stage === "received") return "요청을 접수했습니다. 응답을 준비 중입니다.";
-    if (stage === "tool_context_ready") {
-      const tools = Array.isArray(payload.tools) ? payload.tools.join(", ") : "none";
-      return `도구 컨텍스트 준비 완료 (${tools})`;
-    }
-    if (stage === "api_actions_done") {
-      const actions = Array.isArray(payload.actions) ? payload.actions.join(", ") : "none";
-      return `API 액션 실행 완료 (${actions})`;
-    }
-    if (stage === "multi_agent_reasoning") return "멀티 에이전트 토론을 진행하고 있습니다.";
-    return `처리 단계: ${stage}`;
+    return null;
   }
   return null;
 }
@@ -256,6 +267,61 @@ export default function HomePage() {
       apiKeys.some((item) => item.key_name === "school_api_token"),
     [apiKeys, connectionStatus?.school_api.token_saved, settings.dev_mode]
   );
+  const connectionRows = useMemo(() => {
+    const claudeLevel: HealthLevel = connectionStatus?.claude.reachable ? "ok" : "error";
+    const schoolLevel: HealthLevel = connectionStatus?.school_api.reachable
+      ? "ok"
+      : connectionStatus?.school_api.token_saved
+        ? "warn"
+        : "error";
+    const googleLevel: HealthLevel = connectionStatus?.google_workspace.token_saved ? "ok" : "warn";
+    const dbLevel: HealthLevel = connectionStatus?.database?.connected
+      ? "ok"
+      : settings.dev_mode
+        ? "warn"
+        : "error";
+
+    return [
+      {
+        key: "claude",
+        label: "Claude",
+        status: connectionStatus?.claude.reachable
+          ? "정상 작동중"
+          : `오류 (${connectionStatus?.claude.status ?? "unknown"})`,
+        detail: connectionStatus?.claude.reachable
+          ? null
+          : "Base URL, API 토큰, 게이트웨이 상태를 점검해주세요.",
+        level: claudeLevel
+      },
+      {
+        key: "school",
+        label: "GCS Pulse (api.1000.school)",
+        status: connectionStatus?.school_api.reachable
+          ? "정상 작동중"
+          : connectionStatus?.school_api.token_saved
+            ? `부분 오류 (${connectionStatus?.school_api.status ?? "unknown"})`
+            : "미연결",
+        detail: connectionStatus?.school_api.reason ?? null,
+        level: schoolLevel
+      },
+      {
+        key: "google",
+        label: "Google Workspace",
+        status: connectionStatus?.google_workspace.token_saved ? "연결됨" : "연결 필요",
+        detail: null,
+        level: googleLevel
+      },
+      {
+        key: "database",
+        label: "Database",
+        status: connectionStatus?.database?.connected
+          ? `연결됨 (${connectionStatus.database.source})`
+          : `연결 오류 (${connectionStatus?.database?.source ?? "unknown"})`,
+        detail: connectionStatus?.database?.reason ?? null,
+        level: dbLevel
+      }
+    ] as const;
+  }, [connectionStatus, settings.dev_mode]);
 
   const userId = session?.userId ?? "";
   const userEmail = session?.email ?? null;
@@ -383,6 +449,28 @@ export default function HomePage() {
     [appendAssistantMessage, userId]
   );
 
+  const startNewWorkflow = useCallback(async () => {
+    if (!userId) return;
+    try {
+      const created = await createConversation(userId, {
+        title: `새 워크플로우 (${new Date().toLocaleTimeString("ko-KR", {
+          hour: "2-digit",
+          minute: "2-digit"
+        })})`
+      });
+      setMessages([]);
+      setEvents([]);
+      setTask("");
+      setPersonalInstruction("");
+      setRunning(false);
+      setActiveRunId(null);
+      setActiveConversationId(created.item.id);
+      await refreshConversations(created.item.id);
+    } catch (error) {
+      appendAssistantMessage(`새 워크플로우 생성 실패: ${(error as Error).message}`);
+    }
+  }, [appendAssistantMessage, refreshConversations, userId]);
+
   useEffect(() => {
     const currentSession = session;
     if (!currentSession?.userId) return;
@@ -446,19 +534,47 @@ export default function HomePage() {
           updated_at: item.updated_at
         }));
         setConversations(mappedConversations);
-
-        if (mappedConversations[0]) {
-          setActiveConversationId(mappedConversations[0].id);
-          const messagesResponse = await fetchConversationMessages(
-            sessionUserId,
-            mappedConversations[0].id,
-            120
-          );
+        let nextThreadId: string | null = null;
+        try {
+          const created = await createConversation(sessionUserId, {
+            title: `새 워크플로우 (${new Date().toLocaleTimeString("ko-KR", {
+              hour: "2-digit",
+              minute: "2-digit"
+            })})`
+          });
+          nextThreadId = created.item.id;
           if (!cancelled) {
-            setMessages(toConsoleMessages(messagesResponse.items ?? []));
+            setActiveConversationId(created.item.id);
+            setMessages([]);
           }
-        } else {
-          setMessages([]);
+          const latestConversations = await fetchConversations(sessionUserId, 20);
+          if (!cancelled) {
+            setConversations(
+              (latestConversations.items ?? []).map((item) => ({
+                id: item.id,
+                title: item.title,
+                updated_at: item.updated_at
+              }))
+            );
+          }
+        } catch {
+          nextThreadId = null;
+        }
+
+        if (!nextThreadId) {
+          if (mappedConversations[0]) {
+            setActiveConversationId(mappedConversations[0].id);
+            const messagesResponse = await fetchConversationMessages(
+              sessionUserId,
+              mappedConversations[0].id,
+              120
+            );
+            if (!cancelled) {
+              setMessages(toConsoleMessages(messagesResponse.items ?? []));
+            }
+          } else {
+            setMessages([]);
+          }
         }
 
         const hasSchoolKey = (keysResponse.items ?? []).some(
@@ -644,7 +760,8 @@ export default function HomePage() {
           mode,
           personaStats: settings.chat_mode_personas[mode] ?? DEFAULT_STATS,
           knowledgePrompt: settings.knowledge_base_prompt ?? null,
-          useMock: settings.dev_mode || !connectionStatus?.claude.reachable
+          useMock: settings.dev_mode || !connectionStatus?.claude.reachable,
+          debugRaw: settings.debug_raw_mode
         });
 
         setMessages((current) => {
@@ -855,12 +972,7 @@ export default function HomePage() {
             activeItem={activeView}
             onSelectItem={(id) => setActiveView(id as WorkspaceView)}
             onReset={() => {
-              setMessages([]);
-              setEvents([]);
-              setActiveRunId(null);
-              setRunning(false);
-              setActiveConversationId(null);
-              setTask("");
+              void startNewWorkflow();
             }}
             conversations={previousConversations}
             activeConversationId={activeConversationId}
@@ -980,50 +1092,32 @@ export default function HomePage() {
               <Card className="space-y-3">
                 <CardTitle>사용자 인증 / 연결 현황</CardTitle>
                 <CardDescription>
-                  로그인: {session.provider === "google" ? "Google OAuth" : "Dev 모드"}
-                  <br />
-                  user_id: <span className="font-mono text-xs">{session.userId}</span>
+                  로그인: {session.provider === "google" ? "Google OAuth" : "Dev 모드"} / user_id:{" "}
+                  <span className="font-mono text-[11px]">{session.userId}</span>
                 </CardDescription>
-                <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
-                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
-                    Claude:{" "}
-                    <span className="font-semibold">
-                      {connectionStatus?.claude.reachable ? "정상" : `오류 (${connectionStatus?.claude.status ?? "unknown"})`}
-                    </span>
-                  </p>
-                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
-                    GCS Pulse(api.1000.school):{" "}
-                    <span className="font-semibold">
-                      {connectionStatus?.school_api.reachable
-                        ? "정상"
-                        : connectionStatus?.school_api.token_saved
-                          ? `오류 (${connectionStatus?.school_api.status ?? "unknown"})`
-                          : "미연결"}
-                    </span>
-                    {connectionStatus?.school_api.reason ? (
-                      <span className="mt-1 block text-[10px] text-red-700/90 dark:text-red-300/90">
-                        {connectionStatus.school_api.reason}
-                      </span>
-                    ) : null}
-                    {connectionStatus?.school_api.source ? (
-                      <span className="mt-1 block text-[10px] text-orange-900/70 dark:text-slate-300/80">
-                        source: {connectionStatus.school_api.source}
-                      </span>
-                    ) : null}
-                  </p>
-                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
-                    Google Workspace:{" "}
-                    <span className="font-semibold">
-                      {connectionStatus?.google_workspace.token_saved ? "연결됨" : "미연결"}
-                    </span>
-                  </p>
-                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
-                    DB:{" "}
-                    <span className="font-semibold">
-                      {connectionStatus?.database?.connected ? "연결됨" : "미연결"} (
-                      {connectionStatus?.database?.source ?? "unknown"})
-                    </span>
-                  </p>
+                <div className="space-y-2">
+                  {connectionRows.map((row) => {
+                    const theme = resolveHealthLevelClass(row.level);
+                    return (
+                      <div
+                        key={row.key}
+                        className={`rounded-xl border px-3 py-2 text-xs ${theme.chip}`}
+                      >
+                        <div className="flex items-start gap-2">
+                          <span
+                            className={`mt-[3px] inline-block h-2.5 w-2.5 rounded-full shadow-sm ${theme.dot}`}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-semibold">{row.label}</p>
+                            <p className="mt-0.5">{row.status}</p>
+                            {row.detail ? (
+                              <p className="mt-1 text-[10px] opacity-85">{row.detail}</p>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
                 {forceKeySetup && !settings.dev_mode && (
                   <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/80">
@@ -1063,7 +1157,29 @@ export default function HomePage() {
                   >
                     {settings.dev_mode ? "Dev 모드 해제" : "Dev 모드 활성화"}
                   </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={async () => {
+                      const next = {
+                        ...settings,
+                        debug_raw_mode: !settings.debug_raw_mode
+                      };
+                      setSettings(next);
+                      if (userId) {
+                        try {
+                          await saveWorkspaceSettings(userId, next);
+                        } catch {
+                          // ignore
+                        }
+                      }
+                    }}
+                  >
+                    {settings.debug_raw_mode ? "Debug RAW 해제" : "Debug RAW 활성화"}
+                  </Button>
                 </div>
+                <p className="rounded-xl border border-white/70 bg-white/45 px-3 py-2 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-200">
+                  Debug RAW: {settings.debug_raw_mode ? "활성화됨 (대화창에 원본 JSON 출력)" : "비활성화"}
+                </p>
               </Card>
 
               <Card className="space-y-3">

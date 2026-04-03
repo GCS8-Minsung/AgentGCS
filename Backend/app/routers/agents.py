@@ -187,7 +187,9 @@ def _mode_system_instruction(mode: str) -> str:
         "당신은 AgentGCS 워크스페이스의 협업형 AI 비서다. 한국어로 답변한다. "
         "문제 해결은 ReAct 방식으로 단계화하되, 내부 추론은 노출하지 말고 "
         "사용자에게는 실행 가능한 결과와 핵심 근거만 제시한다. "
-        "필요 시 도구(웹 검색, 학교 API 컨텍스트)를 활용해 순차적으로 해결한다."
+        "필요 시 도구(웹 검색, 학교 API 컨텍스트)를 활용해 순차적으로 해결한다. "
+        "내부 환경 제약을 변명하는 문구(예: '현재 저는 ... 접근 불가')는 출력하지 말고, "
+        "실패 시 원인과 재시도 가능한 대안을 간결하게 제시한다."
     )
     if mode == "cautious":
         return base + " 현재 모드는 신중함이다. 가정은 최소화하고 검증 단계를 먼저 제시한다."
@@ -214,6 +216,44 @@ def _needs_multi_agent(message: str) -> bool:
 
 
 def _needs_web_search(message: str) -> bool:
+    lowered = message.lower()
+    meta_markers = [
+        "검색 기능",
+        "웹 검색 기능",
+        "인터넷 검색 기능",
+        "web_search",
+        "도구",
+        "tool",
+        "세션",
+        "연결",
+        "동작하지",
+        "작동하지",
+        "오류",
+        "fallback",
+    ]
+    topical_markers = [
+        "뉴스",
+        "헤드라인",
+        "시장",
+        "트렌드",
+        "리서치",
+        "논문",
+        "비교",
+        "가격",
+        "주가",
+        "환율",
+        "weather",
+        "stock",
+        "market",
+        "research",
+        "headline",
+        "news",
+    ]
+    if any(marker in lowered for marker in meta_markers) and not any(
+        marker in lowered for marker in topical_markers
+    ):
+        return False
+
     keywords = [
         "검색",
         "인터넷",
@@ -305,6 +345,10 @@ def _compact_json_for_reply(value: object, max_len: int = 1200) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "\n... (truncated)"
+
+
+def _as_json_markdown(value: object) -> str:
+    return "```json\n" + json.dumps(value, ensure_ascii=False, indent=2) + "\n```"
 
 
 def _format_school_api_action_reply(actions: list[dict]) -> str:
@@ -407,13 +451,22 @@ async def _collect_tool_context(user_id: str, message: str) -> list[dict]:
 
     if _needs_web_search(message) or _needs_multi_agent(message):
         sources = await search_trusted_sources(message, max_results=5)
-        contexts.append(
-            {
-                "tool": "web_search",
-                "summary": "인터넷 검색 결과",
-                "data": sources,
-            }
-        )
+        if sources:
+            contexts.append(
+                {
+                    "tool": "web_search",
+                    "summary": "인터넷 검색 결과",
+                    "data": sources,
+                }
+            )
+        else:
+            contexts.append(
+                {
+                    "tool": "web_search",
+                    "summary": "인터넷 검색 결과 없음",
+                    "data": {"query": message, "status": "no_results"},
+                }
+            )
 
     if any(keyword in message for keyword in ["회의실", "예약", "meeting room"]):
         try:
@@ -579,6 +632,67 @@ async def _append_message(
         return local
 
 
+async def _list_recent_thread_messages(
+    *,
+    user_id: str,
+    thread_id: str,
+    limit: int = 24,
+) -> list[dict]:
+    limit = max(1, min(limit, 80))
+    try:
+        def _select():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_messages")
+                .select("role,content,created_at")
+                .eq("user_id", user_id)
+                .eq("thread_id", thread_id)
+                .order("created_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_select)
+        rows = result.data or []
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    local_rows = await dev_store.list_messages(user_id, thread_id, limit=limit)
+    return local_rows or []
+
+
+def _build_history_context_text(messages: list[dict], *, max_messages: int = 16, max_chars: int = 5000) -> str:
+    if not messages:
+        return ""
+
+    usable = [msg for msg in messages if msg.get("role") in {"user", "assistant"}]
+    if not usable:
+        return ""
+    tail = usable[-max_messages:]
+
+    lines: list[str] = []
+    for msg in tail:
+        role = msg.get("role")
+        if role == "assistant":
+            role_label = "assistant"
+        else:
+            role_label = "user"
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role_label}: {content}")
+
+    if not lines:
+        return ""
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
 @router.post("/chat")
 async def chat_with_agent(
     body: AgentChatRequest,
@@ -598,6 +712,18 @@ async def chat_with_agent(
         user_id,
         "chat.processing",
         {"thread_id": thread["id"], "stage": "received", "mode": body.mode},
+    )
+
+    recent_messages = await _list_recent_thread_messages(
+        user_id=user_id,
+        thread_id=thread["id"],
+        limit=28,
+    )
+    history_text = _build_history_context_text(recent_messages)
+    history_block = (
+        f"\n이전 대화 맥락(최근 히스토리):\n{history_text}\n"
+        if history_text
+        else ""
     )
 
     user_settings = await _get_user_settings(user_id)
@@ -662,9 +788,12 @@ async def chat_with_agent(
         )
 
     explicit_tool_result_mode = _is_explicit_tool_result_request(body.message)
-    if explicit_tool_result_mode and api_actions and not _needs_multi_agent(body.message):
+    needs_multi_agent = _needs_multi_agent(body.message)
+    debug_raw_mode = bool(body.debug_raw or user_settings.get("debug_raw_mode", False))
+
+    if explicit_tool_result_mode and api_actions and not needs_multi_agent:
         reply = _format_school_api_action_reply(api_actions)
-    elif _needs_multi_agent(body.message):
+    elif needs_multi_agent:
         await personal_agent_service.ws_manager.emit(
             user_id,
             "chat.processing",
@@ -690,9 +819,11 @@ async def chat_with_agent(
                 + "\n현재 요청은 멀티 에이전트 토론이 필요하다. "
                 "아래 과제 에이전트들을 활용해 단계별(문제정의->근거검증->대안비교->결론)로 종합 답변하라. "
                 "도구 결과가 주어졌다면 이를 최우선 근거로 사용하고, "
-                "환경 제약(권한 없음/접근 불가) 일반론으로 회피하지 마라."
+                "환경 제약(권한 없음/접근 불가) 일반론으로 회피하지 마라. "
+                "이전 대화 맥락이 있다면 이를 반영해 연속성 있게 답변하라."
             ),
             user_prompt=(
+                f"{history_block}\n"
                 f"사용자 요청:\n{body.message}\n"
                 f"{stats_text}\n"
                 f"과제 에이전트:\n" + "\n".join(persona_lines) + "\n"
@@ -711,12 +842,33 @@ async def chat_with_agent(
                 _mode_system_instruction(body.mode)
                 + knowledge_text
                 + "\n도구 결과가 주어졌다면 해당 결과를 근거로 답변하라. "
-                "키 접근 불가/외부 API 접근 불가 같은 일반적 변명을 하지 마라."
+                "키 접근 불가/외부 API 접근 불가 같은 일반적 변명을 하지 마라. "
+                "이전 대화 맥락이 있다면 이어지는 답변으로 작성하라."
             ),
-            user_prompt=f"{body.message}{stats_text}{tool_context_text}",
+            user_prompt=f"{history_block}\n사용자 요청:\n{body.message}\n{stats_text}{tool_context_text}",
             use_mock=body.use_mock,
             cache_hint=f"chat-{body.mode}",
         )
+
+    if debug_raw_mode:
+        debug_payload = {
+            "thread_id": thread["id"],
+            "mode": body.mode,
+            "message": body.message,
+            "needs_multi_agent": needs_multi_agent,
+            "explicit_tool_result_mode": explicit_tool_result_mode,
+            "use_mock": body.use_mock,
+            "claude": {
+                "base_url": user_claude.base_url,
+                "preferred_model": user_claude.preferred_model,
+            },
+            "knowledge_prompt": body.knowledge_prompt,
+            "history_context": history_text,
+            "tool_contexts": tool_contexts,
+            "api_actions": api_actions,
+            "generated_reply": reply,
+        }
+        reply = _as_json_markdown(debug_payload)
 
     assistant_message = await _append_message(
         user_id=user_id,
@@ -725,9 +877,10 @@ async def chat_with_agent(
         content=reply,
         metadata={
             "mode": body.mode,
-            "multi_agent": _needs_multi_agent(body.message),
+            "multi_agent": needs_multi_agent,
             "tools": [ctx["tool"] for ctx in tool_contexts],
             "explicit_tool_result_mode": explicit_tool_result_mode,
+            "debug_raw_mode": debug_raw_mode,
         },
     )
     await personal_agent_service.ws_manager.emit(

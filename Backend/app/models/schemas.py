@@ -125,6 +125,7 @@ class ApprovalPolicy(BaseModel):
 class UserSettingsPayload(BaseModel):
     theme: Literal["light", "dark", "system"] = "system"
     dev_mode: bool = False
+    debug_raw_mode: bool = False
     claude_base_url: str | None = Field(default=None, max_length=500)
     preferred_model: str | None = Field(default=None, max_length=120)
     knowledge_base_prompt: str | None = Field(default=None, max_length=12000)
@@ -153,6 +154,7 @@ class AgentChatRequest(BaseModel):
     persona_stats: PersonaStats | None = None
     knowledge_prompt: str | None = Field(default=None, max_length=12000)
     use_mock: bool = False
+    debug_raw: bool = False
 
 
 class UserBootstrapRequest(BaseModel):

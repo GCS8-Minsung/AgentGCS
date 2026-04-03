@@ -13,6 +13,10 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
     Anthropic = None
 
 
+GENERATION_MAX_TOKENS = 1600
+HTTP_GENERATION_TIMEOUT_SEC = 90.0
+
+
 @dataclass(slots=True)
 class ClaudeService:
     api_key: str | None = None
@@ -52,7 +56,10 @@ class ClaudeService:
         model_candidates = await self._discover_models(secret=secret)
 
         http_text = await self._generate_via_http_fallback(
-            system_prompt, user_prompt, model_candidates=model_candidates
+            system_prompt,
+            user_prompt,
+            model_candidates=model_candidates,
+            max_tokens=GENERATION_MAX_TOKENS,
         )
         if http_text:
             return http_text
@@ -65,6 +72,7 @@ class ClaudeService:
                     user_prompt,
                     cache_hint,
                     model_candidates=model_candidates,
+                    max_tokens=GENERATION_MAX_TOKENS,
                 )
                 if sdk_text:
                     return sdk_text
@@ -82,6 +90,7 @@ class ClaudeService:
         user_prompt: str,
         cache_hint: str,
         model_candidates: list[str],
+        max_tokens: int,
     ) -> str | None:
         if not self._client:
             return None
@@ -96,7 +105,7 @@ class ClaudeService:
                 def _run() -> str:
                     message = self._client.messages.create(
                         model=model,
-                        max_tokens=700,
+                        max_tokens=max_tokens,
                         system=[
                             {
                                 "type": "text",
@@ -129,6 +138,7 @@ class ClaudeService:
         user_prompt: str,
         *,
         model_candidates: list[str],
+        max_tokens: int,
     ) -> str | None:
         if not self.base_url:
             return None
@@ -140,11 +150,14 @@ class ClaudeService:
             secret=secret,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=700,
+            max_tokens=max_tokens,
             model_candidates=model_candidates,
         )
 
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=30.0) as client:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=HTTP_GENERATION_TIMEOUT_SEC,
+        ) as client:
             for path, headers, payload in attempts:
                 try:
                     resp = await client.post(path, headers=headers, json=payload)

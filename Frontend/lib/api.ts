@@ -11,7 +11,7 @@ import {
 } from "@/lib/types";
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
-const REQUEST_TIMEOUT_MS = 90000;
+const REQUEST_TIMEOUT_MS = 180000;
 
 async function request<T>(
   path: string,
@@ -229,6 +229,7 @@ export async function agentChat(params: {
   personaStats?: PersonaStats | null;
   knowledgePrompt?: string | null;
   useMock?: boolean;
+  debugRaw?: boolean;
 }) {
   return request<{
     thread_id: string;
@@ -244,9 +245,10 @@ export async function agentChat(params: {
       mode: params.mode,
       persona_stats: params.personaStats ?? null,
       knowledge_prompt: params.knowledgePrompt ?? null,
-      use_mock: params.useMock ?? false
+      use_mock: params.useMock ?? false,
+      debug_raw: params.debugRaw ?? false
     })
-  }, 180000);
+  }, 420000);
 }
 
 export async function fetchConnectionStatus(userId: string) {

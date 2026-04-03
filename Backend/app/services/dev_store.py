@@ -22,6 +22,7 @@ DEFAULT_PERSONA = {
 DEFAULT_SETTINGS = {
     "theme": "system",
     "dev_mode": False,
+    "debug_raw_mode": False,
     "claude_base_url": "https://claude.1000.school",
     "preferred_model": "gpt-5.2",
     "knowledge_base_prompt": None,

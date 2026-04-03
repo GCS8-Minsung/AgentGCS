@@ -67,8 +67,19 @@ copy .env.example .env.local
 npm run dev
 ```
 
+### 2-1) 서버 상태를 실시간으로 보기 (Windows PowerShell)
+
+검은 화면 대신 서버 로그/상태를 실시간으로 보려면 아래 스크립트를 사용하세요.
+
+```powershell
+# 백엔드/프론트를 각각 "보이는" PowerShell 창으로 실행
+powershell -ExecutionPolicy Bypass -File .\scripts\run-dev-visible.ps1 -StopExisting
+
+# 현재 포트/헬스 상태를 2초마다 갱신해서 모니터링
+powershell -ExecutionPolicy Bypass -File .\scripts\show-server-status.ps1
+```
+
 ### 3) Database
 
 - Supabase SQL Editor에서 `Database/schema.sql` 실행
 - 필요 시 `tasks` 변경 webhook을 FastAPI `POST /api/webhooks/supabase/tasks`에 연결
-
