@@ -127,7 +127,8 @@ class UserSettingsPayload(BaseModel):
     dev_mode: bool = False
     claude_base_url: str | None = Field(default=None, max_length=500)
     preferred_model: str | None = Field(default=None, max_length=120)
-    default_notify_email: EmailStr | None = None
+    knowledge_base_prompt: str | None = Field(default=None, max_length=12000)
+    chat_mode_personas: dict[str, PersonaStats] = Field(default_factory=dict)
     active_persona_id: str | None = None
     personas: list[PersonaProfile] = Field(default_factory=list)
     approval_policy: ApprovalPolicy = Field(default_factory=ApprovalPolicy)
@@ -150,6 +151,7 @@ class AgentChatRequest(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     mode: Literal["cautious", "balanced", "creative", "autonomous"] = "balanced"
     persona_stats: PersonaStats | None = None
+    knowledge_prompt: str | None = Field(default=None, max_length=12000)
     use_mock: bool = False
 
 

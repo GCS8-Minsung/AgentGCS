@@ -28,6 +28,7 @@ class DebateState(TypedDict, total=False):
     evidence: list[dict[str, Any]]
     arguments: dict[str, str]
     final_summary: str
+    claude_service: ClaudeService
     stream_hook: Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
@@ -89,7 +90,16 @@ class DeepTaskOrchestrator:
         graph.add_edge("synthesize", END)
         return graph.compile()
 
-    async def run_and_stream(self, *, user_id: str, run_id: str, request: DeepTaskRequest) -> None:
+    async def run_and_stream(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        request: DeepTaskRequest,
+        claude_override: ClaudeService | None = None,
+    ) -> None:
+        active_claude = claude_override or self.claude_service
+
         async def stream_hook(event_type: str, payload: dict[str, Any]) -> None:
             await self.ws_manager.emit(user_id, event_type, payload, run_id=run_id)
 
@@ -100,6 +110,7 @@ class DeepTaskOrchestrator:
             "use_mock": request.use_mock,
             "persona_stats": request.persona_stats.as_dict(),
             "arguments": {},
+            "claude_service": active_claude,
             "stream_hook": stream_hook,
         }
 
@@ -220,7 +231,8 @@ class DeepTaskOrchestrator:
                 "3) 리스크 1개와 완화책 1개\n"
                 "답변은 한국어로 220자 이내 핵심 bullet 스타일."
             )
-            argument = await self.claude_service.generate(
+            active_claude = state.get("claude_service", self.claude_service)
+            argument = await active_claude.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 use_mock=state.get("use_mock", True),
@@ -249,7 +261,8 @@ class DeepTaskOrchestrator:
         discussion_text = "\n".join(
             f"[{persona}] {text}" for persona, text in state.get("arguments", {}).items()
         )
-        synthesis = await self.claude_service.generate(
+        active_claude = state.get("claude_service", self.claude_service)
+        synthesis = await active_claude.generate(
             system_prompt=(
                 "당신은 토론 정리자입니다. 상충되는 주장도 살리면서 실행 로드맵 중심으로 결론을 만드세요."
             ),

@@ -17,15 +17,27 @@ type Props = {
   value: PersonaStats;
   onChange: (next: PersonaStats) => void;
   showHeader?: boolean;
+  size?: number;
+  title?: string;
+  description?: string;
+  showInputs?: boolean;
 };
 
-const SIZE = 320;
-const CENTER = SIZE / 2;
-const RADIUS = 104;
 const HANDLE_HALO_RADIUS = 9;
 const HANDLE_RADIUS = 6;
 
-function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
+function PersonaRadarComponent({
+  value,
+  onChange,
+  showHeader = true,
+  size = 320,
+  title = "Persona Control (6축 헥사곤)",
+  description = "각 점을 드래그해서 성향(0~100)을 조정합니다.",
+  showInputs = true
+}: Props) {
+  const center = size / 2;
+  const radius = size * 0.325;
+  const safeRadius = Math.max(30, radius - HANDLE_RADIUS - 2);
   const svgRef = useRef<SVGSVGElement>(null);
   const valueRef = useRef<PersonaStats>(value);
   const moveRef = useRef<{ x: number; y: number } | null>(null);
@@ -55,11 +67,11 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
       PERSONA_AXES.map((axis, index) => {
         const ratio = value[axis.key] / 100;
         return {
-          x: CENTER + axisVectors[index].x * RADIUS * ratio,
-          y: CENTER + axisVectors[index].y * RADIUS * ratio
+          x: center + axisVectors[index].x * safeRadius * ratio,
+          y: center + axisVectors[index].y * safeRadius * ratio
         };
       }),
-    [axisVectors, value]
+    [axisVectors, center, safeRadius, value]
   );
 
   const updateAxisByPointer = useCallback(
@@ -67,20 +79,20 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
       const svg = svgRef.current;
       if (!svg) return;
       const rect = svg.getBoundingClientRect();
-      const x = ((clientX - rect.left) / rect.width) * SIZE;
-      const y = ((clientY - rect.top) / rect.height) * SIZE;
-      const dx = x - CENTER;
-      const dy = y - CENTER;
+      const x = ((clientX - rect.left) / rect.width) * size;
+      const y = ((clientY - rect.top) / rect.height) * size;
+      const dx = x - center;
+      const dy = y - center;
 
       const unit = axisVectors[axisIndex];
-      const projected = (dx * unit.x + dy * unit.y) / RADIUS;
+      const projected = (dx * unit.x + dy * unit.y) / safeRadius;
       const nextValue = Math.round(Math.max(0, Math.min(1, projected)) * 100);
       const targetAxis = PERSONA_AXES[axisIndex];
       const currentValue = valueRef.current[targetAxis.key];
       if (currentValue === nextValue) return;
       onChange({ ...valueRef.current, [targetAxis.key]: nextValue });
     },
-    [axisVectors, onChange]
+    [axisVectors, center, onChange, safeRadius, size]
   );
 
   useEffect(() => {
@@ -120,23 +132,26 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
     <Card className="space-y-4">
       {showHeader && (
         <div>
-          <CardTitle>Persona Control (6축 헥사곤)</CardTitle>
-          <CardDescription>각 점을 드래그해서 성향(0~100)을 조정합니다.</CardDescription>
+          <CardTitle>{title}</CardTitle>
+          <CardDescription>{description}</CardDescription>
         </div>
       )}
 
-      <div className="relative mx-auto h-[320px] w-[320px]">
+      <div className="relative mx-auto" style={{ width: `${size}px`, height: `${size}px` }}>
         <ResponsiveContainer width="100%" height="100%">
           <RadarChart
             data={data}
             cx="50%"
             cy="50%"
-            outerRadius={RADIUS}
+            outerRadius={radius}
             startAngle={90}
             endAngle={-270}
           >
             <PolarGrid stroke="#fb923c" strokeOpacity={0.35} />
-            <PolarAngleAxis dataKey="axis" tick={{ fill: "var(--radar-tick-color)", fontSize: 12 }} />
+            <PolarAngleAxis
+              dataKey="axis"
+              tick={{ fill: "var(--radar-tick-color)", fontSize: size < 220 ? 10 : 12 }}
+            />
             <Radar
               dataKey="value"
               fill="#fbbf24"
@@ -150,10 +165,10 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
 
         <svg
           ref={svgRef}
-          width={SIZE}
-          height={SIZE}
+          width={size}
+          height={size}
           className="absolute inset-0 h-full w-full touch-none"
-          viewBox={`0 0 ${SIZE} ${SIZE}`}
+          viewBox={`0 0 ${size} ${size}`}
         >
           {handlePoints.map((point, index) => (
             <g key={PERSONA_AXES[index].key}>
@@ -176,27 +191,29 @@ function PersonaRadarComponent({ value, onChange, showHeader = true }: Props) {
         </svg>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
-        {PERSONA_AXES.map((axis) => (
-          <label key={axis.key} className="space-y-1 text-xs text-orange-900/80">
-            <span className="font-semibold">{axis.label}</span>
-            <Input
-              type="number"
-              min={0}
-              max={100}
-              value={value[axis.key]}
-              onChange={(event) => {
-                const numeric = Number(event.target.value);
-                const clamped = Number.isFinite(numeric)
-                  ? Math.max(0, Math.min(100, numeric))
-                  : 0;
-                if (value[axis.key] === clamped) return;
-                onChange({ ...value, [axis.key]: clamped });
-              }}
-            />
-          </label>
-        ))}
-      </div>
+      {showInputs && (
+        <div className="grid grid-cols-2 gap-2">
+          {PERSONA_AXES.map((axis) => (
+            <label key={axis.key} className="space-y-1 text-xs text-orange-900/80">
+              <span className="font-semibold">{axis.label}</span>
+              <Input
+                type="number"
+                min={0}
+                max={100}
+                value={value[axis.key]}
+                onChange={(event) => {
+                  const numeric = Number(event.target.value);
+                  const clamped = Number.isFinite(numeric)
+                    ? Math.max(0, Math.min(100, numeric))
+                    : 0;
+                  if (value[axis.key] === clamped) return;
+                  onChange({ ...value, [axis.key]: clamped });
+                }}
+              />
+            </label>
+          ))}
+        </div>
+      )}
 
     </Card>
   );

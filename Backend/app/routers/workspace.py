@@ -35,6 +35,15 @@ async def _ensure_supabase_user(user_id: str) -> None:
 
 
 def _default_settings_payload() -> dict:
+    default_chat_mode_personas = deepcopy(
+        DEFAULT_SETTINGS.get("chat_mode_personas")
+        or {
+            "cautious": deepcopy(DEFAULT_PERSONA["stats"]),
+            "balanced": deepcopy(DEFAULT_PERSONA["stats"]),
+            "creative": deepcopy(DEFAULT_PERSONA["stats"]),
+            "autonomous": deepcopy(DEFAULT_PERSONA["stats"]),
+        }
+    )
     return {
         **deepcopy(DEFAULT_SETTINGS),
         "personas": deepcopy(DEFAULT_SETTINGS.get("personas") or [DEFAULT_PERSONA]),
@@ -42,6 +51,8 @@ def _default_settings_payload() -> dict:
             DEFAULT_SETTINGS.get("active_persona_id")
             or (DEFAULT_SETTINGS.get("personas") or [DEFAULT_PERSONA])[0]["id"]
         ),
+        "chat_mode_personas": default_chat_mode_personas,
+        "knowledge_base_prompt": DEFAULT_SETTINGS.get("knowledge_base_prompt"),
     }
 
 
@@ -49,18 +60,27 @@ def _normalize_settings(raw: dict | None) -> dict:
     merged = _default_settings_payload()
     if raw and isinstance(raw, dict):
         merged.update(raw)
-    if merged.get("default_notify_email") == "":
-        merged["default_notify_email"] = None
     if merged.get("claude_base_url") == "":
         merged["claude_base_url"] = None
     if merged.get("preferred_model") == "":
         merged["preferred_model"] = None
+    if merged.get("knowledge_base_prompt") == "":
+        merged["knowledge_base_prompt"] = None
     personas = merged.get("personas")
     if not isinstance(personas, list) or not personas:
         personas = [deepcopy(DEFAULT_PERSONA)]
         merged["personas"] = personas
     if not merged.get("active_persona_id"):
         merged["active_persona_id"] = personas[0]["id"]
+
+    chat_mode_personas = merged.get("chat_mode_personas")
+    if not isinstance(chat_mode_personas, dict):
+        chat_mode_personas = {}
+    for mode in ("cautious", "balanced", "creative", "autonomous"):
+        if not isinstance(chat_mode_personas.get(mode), dict):
+            chat_mode_personas[mode] = deepcopy(DEFAULT_PERSONA["stats"])
+    merged["chat_mode_personas"] = chat_mode_personas
+
     return UserSettingsPayload(**merged).model_dump(mode="json")
 
 

@@ -11,15 +11,17 @@ import {
 } from "@/lib/types";
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
-const REQUEST_TIMEOUT_MS = 15000;
+const REQUEST_TIMEOUT_MS = 90000;
 
 async function request<T>(
   path: string,
   userId: string,
-  options?: RequestInit
+  options?: RequestInit,
+  timeoutMs?: number
 ): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const effectiveTimeoutMs = timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const timeout = window.setTimeout(() => controller.abort(), effectiveTimeoutMs);
   let response: Response;
   try {
     response = await fetch(`${backendUrl}${path}`, {
@@ -34,7 +36,7 @@ async function request<T>(
   } catch (error) {
     if ((error as Error).name === "AbortError") {
       throw new Error(
-        `요청 시간 초과 (${REQUEST_TIMEOUT_MS / 1000}초): ${backendUrl}${path}. 백엔드 상태를 확인해주세요.`
+        `요청 시간 초과 (${Math.floor(effectiveTimeoutMs / 1000)}초): ${backendUrl}${path}. 백엔드 상태를 확인해주세요.`
       );
     }
     throw new Error(
@@ -225,6 +227,7 @@ export async function agentChat(params: {
   title?: string | null;
   mode: AutonomyMode;
   personaStats?: PersonaStats | null;
+  knowledgePrompt?: string | null;
   useMock?: boolean;
 }) {
   return request<{
@@ -240,9 +243,10 @@ export async function agentChat(params: {
       title: params.title ?? null,
       mode: params.mode,
       persona_stats: params.personaStats ?? null,
+      knowledge_prompt: params.knowledgePrompt ?? null,
       use_mock: params.useMock ?? false
     })
-  });
+  }, 180000);
 }
 
 export async function fetchConnectionStatus(userId: string) {

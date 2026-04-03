@@ -27,6 +27,47 @@ class SchoolApiClient:
     bearer_token: str
     timeout: float = DEFAULT_TIMEOUT
 
+    def _auth_headers(self) -> list[tuple[str, dict[str, str]]]:
+        token = self.bearer_token.strip()
+        base = {
+            "Accept": "application/json",
+            "User-Agent": "AgentGCS/1.0 (+https://localhost)",
+        }
+        return [
+            ("bearer", {**base, "Authorization": f"Bearer {token}"}),
+            ("x-api-key", {**base, "x-api-key": token}),
+            ("raw-auth", {**base, "Authorization": token}),
+        ]
+
+    async def _request_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(base_url=SCHOOL_API_BASE_URL, timeout=self.timeout) as client:
+            return await client.request(
+                method,
+                path,
+                params=params,
+                json=json_body,
+                headers=headers,
+            )
+
+    def _parse_response_body(self, response: httpx.Response) -> Any:
+        if not response.text:
+            return {}
+        content_type = response.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
+            return response.json()
+        try:
+            return response.json()
+        except Exception:
+            return {"raw_text": response.text[:800]}
+
     async def _request(
         self,
         method: str,
@@ -35,29 +76,147 @@ class SchoolApiClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        headers = {
-            "Authorization": f"Bearer {self.bearer_token}",
-            "Accept": "application/json",
-        }
-        async with httpx.AsyncClient(base_url=SCHOOL_API_BASE_URL, timeout=self.timeout) as client:
-            response = await client.request(
+        attempts: list[str] = []
+        for auth_style, headers in self._auth_headers():
+            response = await self._request_once(
                 method,
                 path,
-                params=params,
-                json=json_body,
                 headers=headers,
+                params=params,
+                json_body=json_body,
             )
-        if response.status_code >= 400:
+            if response.status_code < 400:
+                return self._parse_response_body(response)
+
+            body_preview = (response.text or "")[:260]
+            attempts.append(f"{auth_style}:{response.status_code}:{body_preview}")
+
+            # 권한 오류는 다른 인증 헤더 포맷으로 재시도한다.
+            if response.status_code in {401, 403}:
+                continue
+
             raise SchoolApiError(
-                f"{method} {path} failed: {response.status_code} {response.text[:300]}"
+                f"{method} {path} failed({response.status_code}) with {auth_style}. "
+                f"body={body_preview}"
             )
-        if not response.text:
-            return {}
-        return response.json()
+
+        raise SchoolApiError(
+            f"{method} {path} auth failed across header variants. attempts={' | '.join(attempts)}"
+        )
+
+    async def _request_any(
+        self,
+        method: str,
+        paths: list[str],
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        errors: list[str] = []
+        for path in paths:
+            try:
+                return await self._request(
+                    method,
+                    path,
+                    params=params,
+                    json_body=json_body,
+                )
+            except SchoolApiError as exc:
+                errors.append(f"{path}: {str(exc)}")
+                continue
+        raise SchoolApiError(
+            f"{method} endpoint candidates exhausted. {' || '.join(errors[:4])}"
+        )
+
+    async def request_known_path(
+        self,
+        *,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized = path.strip()
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+
+        allowed_exact = {
+            "/auth/me",
+            "/teams/me",
+            "/users/me/league",
+            "/snippet_date",
+            "/leaderboards",
+            "/meeting-rooms",
+            "/daily-snippets",
+            "/weekly-snippets",
+            "/openapi.json",
+        }
+        allowed_prefixes = ("/meeting-rooms/", "/daily-snippets/", "/weekly-snippets/")
+        if normalized not in allowed_exact and not any(
+            normalized.startswith(prefix) for prefix in allowed_prefixes
+        ):
+            raise SchoolApiError(
+                f"Path not allowed for safety: {normalized}. "
+                "Use one of the documented school API endpoints."
+            )
+
+        return await self._request(
+            method=method,
+            path=normalized,
+            params=params,
+            json_body=json_body,
+        )
 
     async def list_meeting_rooms(self) -> list[dict]:
         data = await self._request("GET", "/meeting-rooms")
         return data if isinstance(data, list) else []
+
+    async def get_auth_me(self) -> dict:
+        data = await self._request_any("GET", ["/auth/me", "/me", "/users/me"])
+        return data if isinstance(data, dict) else {"raw": data}
+
+    async def get_my_team(self) -> dict:
+        data = await self._request_any("GET", ["/teams/me", "/team/me"])
+        return data if isinstance(data, dict) else {"raw": data}
+
+    async def get_my_league(self) -> dict:
+        data = await self._request_any("GET", ["/users/me/league", "/league/me"])
+        return data if isinstance(data, dict) else {"raw": data}
+
+    async def get_snippet_date(self) -> dict:
+        data = await self._request_any("GET", ["/snippet_date", "/snippet-date"])
+        return data if isinstance(data, dict) else {"raw": data}
+
+    async def get_openapi_summary(self) -> dict:
+        data = await self._request("GET", "/openapi.json")
+        if not isinstance(data, dict):
+            return {"raw": data}
+        paths = data.get("paths")
+        if not isinstance(paths, dict):
+            return {"title": data.get("info", {}).get("title"), "paths": []}
+        summary_paths: list[dict[str, Any]] = []
+        for path, methods in sorted(paths.items())[:120]:
+            if not isinstance(methods, dict):
+                continue
+            method_names = sorted(str(method).upper() for method in methods.keys())
+            summary_paths.append({"path": path, "methods": method_names})
+        return {
+            "title": data.get("info", {}).get("title"),
+            "version": data.get("info", {}).get("version"),
+            "path_count": len(paths),
+            "paths": summary_paths,
+        }
+
+    async def get_leaderboard(
+        self,
+        *,
+        period: str = "daily",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        params = {"period": period, "limit": limit, "offset": offset}
+        data = await self._request_any("GET", ["/leaderboards", "/leaderboard"], params=params)
+        return data if isinstance(data, dict) else {"raw": data}
 
     async def list_room_reservations(self, room_id: int, date: str | None = None) -> list[dict]:
         params = {"date": date} if date else None

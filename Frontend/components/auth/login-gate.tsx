@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { FlaskConical, KeyRound, LogIn } from "lucide-react";
+import { KeyRound, LogIn } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
@@ -50,23 +50,6 @@ export function LoginGate({ onAuthenticated }: Props) {
           localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(mapped));
           onAuthenticated(mapped);
           return;
-        }
-      }
-
-      const raw = localStorage.getItem(AUTH_STORAGE_KEY);
-      if (raw && mounted) {
-        try {
-          const parsed = JSON.parse(raw) as AuthSession;
-          const canReuseLocalSession = !hasSupabaseEnv || parsed.provider === "dev";
-          if (parsed.userId && canReuseLocalSession) {
-            onAuthenticated(parsed);
-            return;
-          }
-          if (!canReuseLocalSession) {
-            localStorage.removeItem(AUTH_STORAGE_KEY);
-          }
-        } catch {
-          localStorage.removeItem(AUTH_STORAGE_KEY);
         }
       }
 
@@ -153,31 +136,10 @@ export function LoginGate({ onAuthenticated }: Props) {
           </p>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            className="gap-2"
-            onClick={() => {
-              const session: AuthSession = {
-                userId: "00000000-0000-0000-0000-000000000001",
-                email: null,
-                fullName: "Dev User",
-                avatarUrl: null,
-                provider: "dev"
-              };
-              localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
-              onAuthenticated(session);
-            }}
-          >
-            <FlaskConical className="h-4 w-4" />
-            Dev 모드로 시작
-          </Button>
-          <Button type="button" variant="ghost" className="gap-2" disabled>
-            <KeyRound className="h-4 w-4" />
-            {hasSupabaseEnv ? "Supabase OAuth 활성" : "Supabase 키 미설정"}
-          </Button>
-        </div>
+        <Button type="button" variant="ghost" className="gap-2" disabled>
+          <KeyRound className="h-4 w-4" />
+          {hasSupabaseEnv ? "Supabase OAuth 활성" : "Supabase 키 미설정"}
+        </Button>
       </Card>
     </main>
   );

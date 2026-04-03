@@ -23,6 +23,9 @@ interface ChatSidebarProps {
   activeConversationId: string | null;
   onSelectConversation: (conversationId: string) => void;
   onOpenSettings: () => void;
+  userName?: string | null;
+  userEmail?: string | null;
+  userAvatarUrl?: string | null;
 }
 
 export function ChatSidebar({
@@ -33,7 +36,10 @@ export function ChatSidebar({
   conversations,
   activeConversationId,
   onSelectConversation,
-  onOpenSettings
+  onOpenSettings,
+  userName,
+  userEmail,
+  userAvatarUrl
 }: ChatSidebarProps) {
   return (
     <aside
@@ -142,12 +148,24 @@ export function ChatSidebar({
         >
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white bg-gradient-to-br from-orange-100 to-orange-200 text-orange-600 shadow-sm">
-                <User className="h-5 w-5" />
-              </div>
+              {userAvatarUrl ? (
+                <img
+                  src={userAvatarUrl}
+                  alt={userName ?? "사용자"}
+                  className="h-10 w-10 rounded-full border border-white object-cover shadow-sm"
+                />
+              ) : (
+                <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white bg-gradient-to-br from-orange-100 to-orange-200 text-orange-600 shadow-sm">
+                  <User className="h-5 w-5" />
+                </div>
+              )}
               <div className="text-left">
-                <p className="text-[13px] font-bold tracking-tight text-gray-800">AgentGCS 사용자</p>
-                <p className="text-[11px] font-medium text-orange-900/60">계정 및 API 설정</p>
+                <p className="truncate text-[13px] font-bold tracking-tight text-gray-800">
+                  {userName ?? "AgentGCS 사용자"}
+                </p>
+                <p className="truncate text-[11px] font-medium text-orange-900/60">
+                  {userEmail ?? "계정 및 API 설정"}
+                </p>
               </div>
             </div>
             <div className="rounded-xl p-2 transition-colors group-hover:bg-white/60">

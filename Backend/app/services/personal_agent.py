@@ -18,8 +18,16 @@ class PersonalAgentService:
         self.ws_manager = ws_manager
         self.claude_service = claude_service
 
-    async def trigger_manual(self, *, user_id: str, instruction: str, use_mock: bool = True) -> dict:
-        plan = await self.claude_service.generate(
+    async def trigger_manual(
+        self,
+        *,
+        user_id: str,
+        instruction: str,
+        use_mock: bool = True,
+        claude_override: ClaudeService | None = None,
+    ) -> dict:
+        active_claude = claude_override or self.claude_service
+        plan = await active_claude.generate(
             system_prompt=(
                 "당신은 개인 업무 자동화 에이전트다. Gmail, Google Calendar, 교내 API, Kanban CRUD 도구를 "
                 "호출한다는 가정으로 간결한 실행 계획을 제안한다."

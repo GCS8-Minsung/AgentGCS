@@ -7,7 +7,6 @@ import {
   Layers3,
   LogOut,
   RadioTower,
-  Sparkles,
   Wrench
 } from "lucide-react";
 
@@ -52,8 +51,6 @@ import {
   UserSettings
 } from "@/lib/types";
 
-const DEFAULT_TASK =
-  "볼류메트릭 디스플레이 3D 식물/크리처 렌더링 테스트에 대한 비즈니스 모델 구축";
 const MAX_MESSAGES = 160;
 const MAX_EVENTS = 180;
 
@@ -70,8 +67,42 @@ const DEFAULT_SETTINGS: UserSettings = {
   theme: "system",
   dev_mode: false,
   claude_base_url: "https://claude.1000.school",
-  preferred_model: "claude-3-5-sonnet-20241022",
-  default_notify_email: null,
+  preferred_model: "gpt-5.2",
+  knowledge_base_prompt: null,
+  chat_mode_personas: {
+    cautious: {
+      creativity: 42,
+      logic: 92,
+      critical_thinking: 95,
+      data_dependency: 88,
+      empathy: 52,
+      drive: 58
+    },
+    balanced: {
+      creativity: 74,
+      logic: 78,
+      critical_thinking: 79,
+      data_dependency: 72,
+      empathy: 64,
+      drive: 72
+    },
+    creative: {
+      creativity: 96,
+      logic: 62,
+      critical_thinking: 58,
+      data_dependency: 46,
+      empathy: 68,
+      drive: 86
+    },
+    autonomous: {
+      creativity: 72,
+      logic: 82,
+      critical_thinking: 78,
+      data_dependency: 66,
+      empathy: 54,
+      drive: 93
+    }
+  },
   active_persona_id: "default-balanced",
   personas: [
     {
@@ -104,7 +135,7 @@ type ConsoleMessage = {
   timestamp: Date;
 };
 
-type WorkspaceView = "multi_agent" | "kanban" | "automation" | "task_automation";
+type WorkspaceView = "multi_agent" | "kanban" | "automation";
 
 function resolveWsBase() {
   if (process.env.NEXT_PUBLIC_BACKEND_WS_URL) return process.env.NEXT_PUBLIC_BACKEND_WS_URL;
@@ -128,6 +159,20 @@ function summarizeEvent(event: AgentEvent): string | null {
   }
   if (event.event_type === "toast.notification" && typeof payload.description === "string") {
     return payload.description;
+  }
+  if (event.event_type === "chat.processing") {
+    const stage = String(payload.stage ?? "processing");
+    if (stage === "received") return "요청을 접수했습니다. 응답을 준비 중입니다.";
+    if (stage === "tool_context_ready") {
+      const tools = Array.isArray(payload.tools) ? payload.tools.join(", ") : "none";
+      return `도구 컨텍스트 준비 완료 (${tools})`;
+    }
+    if (stage === "api_actions_done") {
+      const actions = Array.isArray(payload.actions) ? payload.actions.join(", ") : "none";
+      return `API 액션 실행 완료 (${actions})`;
+    }
+    if (stage === "multi_agent_reasoning") return "멀티 에이전트 토론을 진행하고 있습니다.";
+    return `처리 단계: ${stage}`;
   }
   return null;
 }
@@ -159,13 +204,6 @@ function mergeApiKeys(current: ApiKeyMeta[], incoming: ApiKeyMeta[]): ApiKeyMeta
   return Array.from(merged.values()).sort((a, b) => a.key_name.localeCompare(b.key_name));
 }
 
-function modeLabel(mode: AutonomyMode): string {
-  if (mode === "cautious") return "신중함";
-  if (mode === "creative") return "창의적";
-  if (mode === "autonomous") return "완전자율";
-  return "균형형";
-}
-
 export default function HomePage() {
   const [session, setSession] = useState<AuthSession | null>(null);
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
@@ -187,21 +225,25 @@ export default function HomePage() {
   const [conversations, setConversations] = useState<ConversationPreview[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 
-  const [task, setTask] = useState(DEFAULT_TASK);
-  const [taskMode, setTaskMode] = useState<AutonomyMode>("balanced");
-  const [personalInstruction, setPersonalInstruction] = useState(
-    "이번 주 마감 과제와 발표 준비 일정 정리해서 캘린더 액션 초안 생성해줘"
-  );
+  const [task, setTask] = useState("");
+  const [personalInstruction, setPersonalInstruction] = useState("");
   const [loadingWorkspace, setLoadingWorkspace] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  const apiKeysRef = useRef<ApiKeyMeta[]>([]);
+  const devModeRef = useRef<boolean>(settings.dev_mode);
 
-  const activePersona = useMemo(() => {
+  const activeTaskPersona = useMemo(() => {
     const target = settings.personas.find((persona) => persona.id === settings.active_persona_id);
     return target ?? settings.personas[0] ?? null;
   }, [settings.active_persona_id, settings.personas]);
+
+  const previousConversations = useMemo(
+    () => conversations.filter((conversation) => conversation.id !== activeConversationId),
+    [activeConversationId, conversations]
+  );
 
   const streamBadge = useMemo(
     () => (socketConnected ? "실시간 연결됨" : "실시간 연결 끊김"),
@@ -217,6 +259,14 @@ export default function HomePage() {
 
   const userId = session?.userId ?? "";
   const userEmail = session?.email ?? null;
+
+  useEffect(() => {
+    apiKeysRef.current = apiKeys;
+  }, [apiKeys]);
+
+  useEffect(() => {
+    devModeRef.current = settings.dev_mode;
+  }, [settings.dev_mode]);
 
   const renderedMessages = useMemo(
     () =>
@@ -287,16 +337,21 @@ export default function HomePage() {
 
   const refreshConnectionStatus = useCallback(async () => {
     if (!userId) return;
-    const localHasSchoolToken = apiKeys.some((item) => item.key_name === "school_api_token");
+    const localHasSchoolToken = apiKeysRef.current.some(
+      (item) => item.key_name === "school_api_token"
+    );
+    const devModeEnabled = devModeRef.current;
     try {
       const response = await fetchConnectionStatus(userId);
       setConnectionStatus(response);
-      setForceKeySetup(!response.school_api.token_saved && !localHasSchoolToken && !settings.dev_mode);
+      setForceKeySetup(
+        !response.school_api.token_saved && !localHasSchoolToken && !devModeEnabled
+      );
     } catch {
       setConnectionStatus(null);
-      setForceKeySetup(!localHasSchoolToken && !settings.dev_mode);
+      setForceKeySetup(!localHasSchoolToken && !devModeEnabled);
     }
-  }, [apiKeys, settings.dev_mode, userId]);
+  }, [userId]);
 
   const refreshKeys = useCallback(async () => {
     if (!userId) return [];
@@ -310,9 +365,9 @@ export default function HomePage() {
       });
       return merged;
     } catch {
-      return apiKeys;
+      return apiKeysRef.current;
     }
-  }, [apiKeys, userId]);
+  }, [userId]);
 
   const openConversation = useCallback(
     async (threadId: string) => {
@@ -336,10 +391,18 @@ export default function HomePage() {
     const sessionFullName = currentSession.fullName;
     const sessionAvatarUrl = currentSession.avatarUrl;
     let cancelled = false;
+    let watchdog: number | null = null;
 
     async function initialize() {
       setLoadingWorkspace(true);
       setWorkspaceError(null);
+      watchdog = window.setTimeout(() => {
+        if (cancelled) return;
+        setLoadingWorkspace(false);
+        setWorkspaceError((current) =>
+          current ?? "초기화가 지연되어 일부 기능만 먼저 표시합니다."
+        );
+      }, 20000);
       try {
         await bootstrapUser({
           userId: sessionUserId,
@@ -355,7 +418,25 @@ export default function HomePage() {
         ]);
         if (cancelled) return;
 
-        const nextSettings = settingsResponse.settings ?? DEFAULT_SETTINGS;
+        const nextSettings: UserSettings = {
+          ...DEFAULT_SETTINGS,
+          ...(settingsResponse.settings ?? DEFAULT_SETTINGS),
+          chat_mode_personas: {
+            ...DEFAULT_SETTINGS.chat_mode_personas,
+            ...(settingsResponse.settings?.chat_mode_personas ?? {})
+          }
+        };
+        if (
+          !nextSettings.preferred_model ||
+          nextSettings.preferred_model === "claude-3-5-sonnet-20241022"
+        ) {
+          nextSettings.preferred_model = "gpt-5.2";
+          try {
+            await saveWorkspaceSettings(sessionUserId, nextSettings);
+          } catch {
+            // ignore model migration errors
+          }
+        }
         setSettings(nextSettings);
         setApiKeys(keysResponse.items ?? []);
 
@@ -389,6 +470,9 @@ export default function HomePage() {
           setWorkspaceError((error as Error).message);
         }
       } finally {
+        if (watchdog !== null) {
+          window.clearTimeout(watchdog);
+        }
         if (!cancelled) {
           setLoadingWorkspace(false);
         }
@@ -400,8 +484,11 @@ export default function HomePage() {
 
     return () => {
       cancelled = true;
+      if (watchdog !== null) {
+        window.clearTimeout(watchdog);
+      }
     };
-  }, [refreshConnectionStatus, session]);
+  }, [session, refreshConnectionStatus]);
 
   useEffect(() => {
     if (!userId) return;
@@ -508,13 +595,13 @@ export default function HomePage() {
       if (mode === "autonomous") return true;
 
       if (mode === "cautious" && settings.approval_policy.cautious_requires_approval) {
-        return window.confirm("신중함 모드의 외부 API 작업을 실행할까요?");
+        return window.confirm("신중함 모드 위험 작업 진행시 의무 승인 요청: 계속할까요?");
       }
       if (mode === "balanced" && settings.approval_policy.balanced_requires_approval) {
-        return window.confirm("균형형 모드의 외부 API 작업을 실행할까요?");
+        return window.confirm("균형형 모드 위험 작업 진행시 의무 승인 요청: 계속할까요?");
       }
       if (mode === "creative" && settings.approval_policy.creative_requires_approval) {
-        return window.confirm("창의적 모드의 외부 API 작업을 실행할까요?");
+        return window.confirm("창의적 모드 위험 작업 진행시 의무 승인 요청: 계속할까요?");
       }
       return true;
     },
@@ -555,7 +642,8 @@ export default function HomePage() {
           threadId: activeConversationId,
           title: text.slice(0, 30),
           mode,
-          personaStats: activePersona?.stats,
+          personaStats: settings.chat_mode_personas[mode] ?? DEFAULT_STATS,
+          knowledgePrompt: settings.knowledge_base_prompt ?? null,
           useMock: settings.dev_mode || !connectionStatus?.claude.reachable
         });
 
@@ -585,7 +673,6 @@ export default function HomePage() {
     },
     [
       activeConversationId,
-      activePersona?.stats,
       appendAssistantMessage,
       connectionStatus?.claude.reachable,
       hasSchoolApiToken,
@@ -616,7 +703,11 @@ export default function HomePage() {
       ...nextSettings,
       claude_base_url: nextSettings.claude_base_url?.trim() || null,
       preferred_model: nextSettings.preferred_model?.trim() || null,
-      default_notify_email: nextSettings.default_notify_email?.trim() || null
+      knowledge_base_prompt: nextSettings.knowledge_base_prompt?.trim() || null,
+      chat_mode_personas: {
+        ...DEFAULT_SETTINGS.chat_mode_personas,
+        ...nextSettings.chat_mode_personas
+      }
     };
     const response = await saveWorkspaceSettings(userId, normalized);
     setSettings(response.settings);
@@ -660,20 +751,25 @@ export default function HomePage() {
       setSettingsOpen(true);
       return;
     }
+    if (settings.personas.length < 3) {
+      appendAssistantMessage("과제 자동화를 시작하려면 멀티 에이전트 페르소나를 최소 3개 이상 설정해야 합니다.");
+      setSettingsOpen(true);
+      return;
+    }
 
-    const approved = await maybeRequireApproval(taskMode, true);
+    const approved = await maybeRequireApproval("balanced", true);
     if (!approved) return;
 
     setRunning(true);
-    setActiveView("task_automation");
+    setActiveView("multi_agent");
 
     try {
-      const notifyCandidate = settings.default_notify_email ?? userEmail ?? undefined;
+      const notifyCandidate = userEmail ?? undefined;
       const notifyEmail = isValidEmail(notifyCandidate) ? notifyCandidate : undefined;
       const response = await startDeepTask({
         userId,
         task: trimmedTask,
-        personaStats: activePersona?.stats ?? DEFAULT_STATS,
+        personaStats: activeTaskPersona?.stats ?? DEFAULT_STATS,
         notifyEmail,
         useMock: settings.dev_mode || !connectionStatus?.claude.reachable
       });
@@ -691,8 +787,20 @@ export default function HomePage() {
 
   async function handlePersonalTrigger() {
     if (!userId) return;
+    if (!personalInstruction.trim()) {
+      appendAssistantMessage("업무 자동화 요청을 먼저 입력해주세요.");
+      return;
+    }
+    if (!hasSchoolApiToken && !settings.dev_mode) {
+      appendAssistantMessage("API 키를 입력하세요. `api.1000.school` 토큰 저장 후 업무 자동화를 실행할 수 있습니다.");
+      setSettingsOpen(true);
+      return;
+    }
     try {
-      const response = await triggerPersonalAgent({ userId, instruction: personalInstruction });
+      const response = await triggerPersonalAgent({
+        userId,
+        instruction: personalInstruction.trim()
+      });
       setActiveView("automation");
       appendEvent({
         event_type: "personal_agent.local_echo",
@@ -708,8 +816,7 @@ export default function HomePage() {
   const sidebarItems: SidebarItem[] = [
     { id: "multi_agent", title: "멀티 에이전트 콘솔", subtitle: "AI 대화 및 상태 스트림" },
     { id: "kanban", title: "칸반 워크스페이스", subtitle: "마일스톤/Task 관리" },
-    { id: "automation", title: "업무 자동화 센터", subtitle: "개인 업무 에이전트 도구" },
-    { id: "task_automation", title: "과제 자동화 센터", subtitle: "심층 과제 실행/토론" }
+    { id: "automation", title: "업무 자동화 센터", subtitle: "개인 업무 에이전트 도구" }
   ];
 
   const handleCloseSettings = useCallback(() => {
@@ -753,15 +860,18 @@ export default function HomePage() {
               setActiveRunId(null);
               setRunning(false);
               setActiveConversationId(null);
-              setTask(DEFAULT_TASK);
+              setTask("");
             }}
-            conversations={conversations}
+            conversations={previousConversations}
             activeConversationId={activeConversationId}
             onSelectConversation={(threadId) => {
               void openConversation(threadId);
               setActiveView("multi_agent");
             }}
             onOpenSettings={() => setSettingsOpen(true)}
+            userName={session.fullName}
+            userEmail={session.email}
+            userAvatarUrl={session.avatarUrl}
           />
 
           <section className="relative z-10 flex min-h-0 flex-1 flex-col">
@@ -778,6 +888,18 @@ export default function HomePage() {
             <div className="flex items-center gap-2">
               <Badge>{streamBadge}</Badge>
               <Badge>{settings.dev_mode ? "Dev 모드" : "운영 모드"}</Badge>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => {
+                  clearAuthSession();
+                  window.location.reload();
+                }}
+              >
+                <LogOut className="h-4 w-4" />
+                로그아웃
+              </Button>
             </div>
           </div>
           {workspaceError && (
@@ -856,26 +978,63 @@ export default function HomePage() {
 
             <div className="min-h-0 space-y-4 overflow-y-auto pb-2 pr-1">
               <Card className="space-y-3">
-                <CardTitle>사용자 인증 / API 연결 현황</CardTitle>
+                <CardTitle>사용자 인증 / 연결 현황</CardTitle>
                 <CardDescription>
                   로그인: {session.provider === "google" ? "Google OAuth" : "Dev 모드"}
                   <br />
                   user_id: <span className="font-mono text-xs">{session.userId}</span>
                 </CardDescription>
-                <div className="flex flex-wrap gap-2 text-xs">
-                  <Badge>{connectionStatus?.claude.status ?? "Claude 상태 확인 전"}</Badge>
-                  <Badge>
-                    {connectionStatus?.school_api.token_saved
-                      ? "School 토큰 저장됨"
-                      : "School 토큰 없음"}
-                  </Badge>
-                  <Badge>
-                    {connectionStatus?.google_workspace.token_saved
-                      ? "Google OAuth 연결됨"
-                      : "Google OAuth 미연결"}
-                  </Badge>
-                  <Badge>{settings.dev_mode ? "DB 우회 테스트 가능" : "DB 연결 사용"}</Badge>
+                <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
+                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
+                    Claude:{" "}
+                    <span className="font-semibold">
+                      {connectionStatus?.claude.reachable ? "정상" : `오류 (${connectionStatus?.claude.status ?? "unknown"})`}
+                    </span>
+                  </p>
+                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
+                    GCS Pulse(api.1000.school):{" "}
+                    <span className="font-semibold">
+                      {connectionStatus?.school_api.reachable
+                        ? "정상"
+                        : connectionStatus?.school_api.token_saved
+                          ? `오류 (${connectionStatus?.school_api.status ?? "unknown"})`
+                          : "미연결"}
+                    </span>
+                    {connectionStatus?.school_api.reason ? (
+                      <span className="mt-1 block text-[10px] text-red-700/90 dark:text-red-300/90">
+                        {connectionStatus.school_api.reason}
+                      </span>
+                    ) : null}
+                    {connectionStatus?.school_api.source ? (
+                      <span className="mt-1 block text-[10px] text-orange-900/70 dark:text-slate-300/80">
+                        source: {connectionStatus.school_api.source}
+                      </span>
+                    ) : null}
+                  </p>
+                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
+                    Google Workspace:{" "}
+                    <span className="font-semibold">
+                      {connectionStatus?.google_workspace.token_saved ? "연결됨" : "미연결"}
+                    </span>
+                  </p>
+                  <p className="rounded-xl border border-white/70 bg-white/55 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
+                    DB:{" "}
+                    <span className="font-semibold">
+                      {connectionStatus?.database?.connected ? "연결됨" : "미연결"} (
+                      {connectionStatus?.database?.source ?? "unknown"})
+                    </span>
+                  </p>
                 </div>
+                {forceKeySetup && !settings.dev_mode && (
+                  <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/80">
+                    `api.1000.school` 토큰을 먼저 저장해주세요.
+                  </p>
+                )}
+              </Card>
+
+              <Card className="space-y-3">
+                <CardTitle>개발 도구</CardTitle>
+                <CardDescription>설정/개발 모드 전환 등 개발용 제어 버튼입니다.</CardDescription>
                 <div className="flex flex-wrap gap-2">
                   <Button
                     variant="secondary"
@@ -904,45 +1063,19 @@ export default function HomePage() {
                   >
                     {settings.dev_mode ? "Dev 모드 해제" : "Dev 모드 활성화"}
                   </Button>
-                  <Button
-                    variant="ghost"
-                    className="gap-1.5"
-                    onClick={() => {
-                      clearAuthSession();
-                      window.location.reload();
-                    }}
-                  >
-                    <LogOut className="h-4 w-4" />
-                    로그아웃
-                  </Button>
                 </div>
-                {forceKeySetup && !settings.dev_mode && (
-                  <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/80">
-                    `api.1000.school` 토큰을 먼저 저장해주세요.
-                  </p>
-                )}
               </Card>
 
               <Card className="space-y-3">
-                <CardTitle>과제 자동화 센터</CardTitle>
+                <CardTitle>멀티 에이전트 콘솔 (과제 자동화)</CardTitle>
                 <CardDescription>
-                  시나리오 빠른 실행이 통합된 패널입니다. 선택한 페르소나로 심층 토론 파이프라인을 실행합니다.
+                  과제 해결 전용 멀티 에이전트 실행 패널입니다. 설정된 과제 페르소나(최소 3개)로 심층 토론을 시작합니다.
                 </CardDescription>
-                <Textarea value={task} onChange={(event) => setTask(event.target.value)} />
-                <div className="flex flex-wrap gap-2">
-                  {(["cautious", "balanced", "creative", "autonomous"] as AutonomyMode[]).map(
-                    (mode) => (
-                      <Button
-                        key={mode}
-                        size="sm"
-                        variant={taskMode === mode ? "accent" : "secondary"}
-                        onClick={() => setTaskMode(mode)}
-                      >
-                        {modeLabel(mode)}
-                      </Button>
-                    )
-                  )}
-                </div>
+                <Textarea
+                  value={task}
+                  onChange={(event) => setTask(event.target.value)}
+                  placeholder="해결할 과제를 입력하세요..."
+                />
                 <div className="flex flex-wrap gap-2">
                   <Button
                     onClick={() => void handleStartDeepTask()}
@@ -953,10 +1086,10 @@ export default function HomePage() {
                   <Button
                     variant="secondary"
                     onClick={() => {
-                      setTask(DEFAULT_TASK);
+                      setTask("");
                     }}
                   >
-                    기본값 복원
+                    입력 비우기
                   </Button>
                 </div>
                 {activeRunId && (
@@ -964,6 +1097,9 @@ export default function HomePage() {
                     run_id: {activeRunId}
                   </p>
                 )}
+                <p className="rounded-xl border border-white/70 bg-white/45 px-3 py-2 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300">
+                  현재 설정된 과제 에이전트 수: {settings.personas.length}개
+                </p>
                 {!hasSchoolApiToken && (
                   <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/85">
                     API 키를 입력하세요. `api.1000.school` 토큰이 없으면 과제 자동화 API가 비활성화됩니다.
@@ -977,8 +1113,13 @@ export default function HomePage() {
                 <Textarea
                   value={personalInstruction}
                   onChange={(event) => setPersonalInstruction(event.target.value)}
+                  placeholder="자동화할 업무 요청을 입력하세요..."
                 />
-                <Button onClick={() => void handlePersonalTrigger()} className="gap-2">
+                <Button
+                  onClick={() => void handlePersonalTrigger()}
+                  className="gap-2"
+                  disabled={!personalInstruction.trim()}
+                >
                   <Bolt className="h-4 w-4" />
                   개인 업무 에이전트 실행
                 </Button>
@@ -1009,21 +1150,6 @@ export default function HomePage() {
                 </div>
               </Card>
 
-              {connectionStatus?.claude.attempts && connectionStatus.claude.attempts.length > 0 && (
-                <Card className="space-y-2">
-                  <CardTitle>Claude 연결 진단</CardTitle>
-                  <CardDescription>
-                    `claude.1000.school` 우회 연결 결과입니다. 502가 반복되면 게이트웨이 측 점검이 필요합니다.
-                  </CardDescription>
-                  <div className="max-h-40 space-y-1 overflow-y-auto rounded-xl bg-white/60 p-2 text-xs text-orange-900/85 dark:bg-slate-900/60">
-                    {connectionStatus.claude.attempts.map((attempt, index) => (
-                      <pre key={index} className="whitespace-pre-wrap break-all">
-                        {JSON.stringify(attempt, null, 2)}
-                      </pre>
-                    ))}
-                  </div>
-                </Card>
-              )}
             </div>
           </div>
         )}
@@ -1039,24 +1165,10 @@ export default function HomePage() {
         {activeView === "automation" && (
           <div className="px-4 pb-4">
             <Card className="space-y-3">
-              <CardTitle>자동화 센터 보조 패널</CardTitle>
+              <CardTitle>업무 자동화 안내</CardTitle>
               <CardDescription>
-                현재 이벤트 기준 추천: 이메일 통보 정책/웹훅 룰/개인 API 키 저장을 우선 구성하세요.
+                업무 자동화 센터에서 요청을 입력하면 학교 API 및 Google 연동 작업을 수동 실행합니다.
               </CardDescription>
-              <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
-                <div className="rounded-xl border border-white/80 bg-white/50 p-3 text-sm text-orange-900/80 dark:bg-slate-800/70">
-                  <Sparkles className="mb-1 h-4 w-4" />
-                  마감 임박 토스트 규칙 점검
-                </div>
-                <div className="rounded-xl border border-white/80 bg-white/50 p-3 text-sm text-orange-900/80 dark:bg-slate-800/70">
-                  <Bolt className="mb-1 h-4 w-4" />
-                  개인 업무 프롬프트 템플릿 관리
-                </div>
-                <div className="rounded-xl border border-white/80 bg-white/50 p-3 text-sm text-orange-900/80 dark:bg-slate-800/70">
-                  <RadioTower className="mb-1 h-4 w-4" />
-                  실시간 알림 채널 테스트
-                </div>
-              </div>
             </Card>
           </div>
         )}

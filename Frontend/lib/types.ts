@@ -59,7 +59,8 @@ export type UserSettings = {
   dev_mode: boolean;
   claude_base_url?: string | null;
   preferred_model?: string | null;
-  default_notify_email?: string | null;
+  knowledge_base_prompt?: string | null;
+  chat_mode_personas: Record<AutonomyMode, PersonaStats>;
   active_persona_id: string | null;
   personas: PersonaProfile[];
   approval_policy: ApprovalPolicy;
@@ -99,10 +100,18 @@ export type ClaudeConnectionStatus = {
   reachable: boolean;
   status: string;
   attempts: Array<Record<string, unknown>>;
+  available_models?: string[];
 };
 
 export type WorkspaceConnectionStatus = {
   claude: ClaudeConnectionStatus;
-  school_api: { token_saved: boolean };
+  school_api: {
+    token_saved: boolean;
+    reachable?: boolean;
+    status?: string;
+    reason?: string | null;
+    source?: "user_key" | "env_fallback" | "none";
+  };
   google_workspace: { token_saved: boolean };
+  database: { connected: boolean; source: "supabase" | "dev_store"; reason?: string | null };
 };
