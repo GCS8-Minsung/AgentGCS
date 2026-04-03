@@ -398,8 +398,4 @@ class ClaudeService:
 
     def _mock_response(self, system_prompt: str, user_prompt: str) -> str:
         condensed_system = system_prompt.split(".")[0].strip()
-        return (
-            f"[MOCK:{condensed_system}] "
-            f"{user_prompt[:220]} ... 실행 가능한 소규모 검증(시장 테스트, 제작비 추정, "
-            "초기 고객 인터뷰)을 먼저 배치하고 리스크를 계량화해야 합니다."
-        )
+        return f"[MOCK:{condensed_system}] {user_prompt[:220]} ... 초안 응답입니다. 실제 연결 시 상세 결과가 생성됩니다."

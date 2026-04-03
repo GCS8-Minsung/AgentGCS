@@ -64,6 +64,17 @@ QUERY_TRANSLATIONS_KO_EN = {
     "네이버": "naver",
 }
 
+GENERIC_RESEARCH_TOKENS = {
+    "paper",
+    "research",
+    "study",
+    "journal",
+    "article",
+    "논문",
+    "학술",
+    "리서치",
+}
+
 COMMAND_PHRASES = (
     "인터넷 검색",
     "웹 검색",
@@ -91,6 +102,8 @@ WEATHER_KEYWORDS = (
     "forecast",
     "humidity",
 )
+
+SEARCH_MODES = {"auto", "anthropic", "custom"}
 
 KOREAN_CITY_ALIASES = {
     "서울": "Seoul",
@@ -156,7 +169,7 @@ def _extract_intent_query(raw_query: str) -> str:
     # Prefer explicit "검색은 ...", "검색어는 ..." style payload if present.
     marker_patterns = [
         r"(?:검색(?:어| 키워드)?(?:는|:)\s*)(?P<q>.+)$",
-        r"(?:search(?:\s+for)?\s*[:\-]?\s*)(?P<q>.+)$",
+        r"(?:\bsearch\b(?:\s+for)?\s*[:\-]?\s*)(?P<q>.+)$",
     ]
     for pattern in marker_patterns:
         match = re.search(pattern, query, flags=re.IGNORECASE)
@@ -175,9 +188,14 @@ def _extract_intent_query(raw_query: str) -> str:
 
     lowered = query.lower()
     for phrase in COMMAND_PHRASES:
-        if phrase in lowered:
-            query = re.sub(re.escape(phrase), " ", query, flags=re.IGNORECASE)
-            lowered = query.lower()
+        if phrase not in lowered:
+            continue
+        if re.fullmatch(r"[A-Za-z\s\-]+", phrase):
+            pattern = rf"(?<![A-Za-z]){re.escape(phrase)}(?![A-Za-z])"
+        else:
+            pattern = re.escape(phrase)
+        query = re.sub(pattern, " ", query, flags=re.IGNORECASE)
+        lowered = query.lower()
 
     query = re.sub(r"\b(해줘|해주세요|해 봐|해봐|시도해줘|부탁해)\b", " ", query)
     query = re.sub(r"\s+", " ", query).strip(" .!?\t\"'")
@@ -378,6 +396,34 @@ def _extract_weather_location(query: str) -> str:
 
 def _is_korean_text(text: str) -> bool:
     return bool(re.search(r"[가-힣]", text or ""))
+
+
+def _get_search_mode() -> str:
+    mode = (os.getenv("AGENTGCS_SEARCH_MODE") or "auto").strip().lower()
+    if mode not in SEARCH_MODES:
+        return "auto"
+    return mode
+
+
+def _needs_fresh_web_data(query: str) -> bool:
+    lowered = query.lower()
+    freshness_tokens = [
+        "최신",
+        "오늘",
+        "현재",
+        "방금",
+        "실시간",
+        "뉴스",
+        "속보",
+        "latest",
+        "today",
+        "current",
+        "real-time",
+        "realtime",
+        "breaking",
+        "news",
+    ]
+    return any(token in query or token in lowered for token in freshness_tokens)
 
 
 def _weather_location_candidates(location: str) -> list[str]:
@@ -1087,6 +1133,9 @@ async def _search_crossref_api(query: str, max_results: int) -> list[dict]:
         title = _clean_text(title_arr[0]) if isinstance(title_arr, list) and title_arr else ""
         if not title:
             continue
+        lowered_title = title.lower().strip()
+        if lowered_title in {"paper", "article", "editorial"} or len(title) < 8:
+            continue
         doi = item.get("DOI")
         if isinstance(doi, str) and doi:
             link = f"https://doi.org/{doi}"
@@ -1249,8 +1298,94 @@ def _dedupe_and_rank(query: str, docs: list[dict], max_results: int) -> list[dic
     if not relevant_only:
         return []
 
+    if prefer_academic:
+        academic_only = []
+        for row in relevant_only:
+            source = str(row.get("source") or "")
+            domain = _extract_domain(str(row.get("url") or ""))
+            if source.startswith("academic_") or "arxiv.org" in domain or "doi.org" in domain:
+                if _passes_deep_research_specificity(query, row):
+                    academic_only.append(row)
+        if academic_only:
+            relevant_only = academic_only
+
     relevant_only.sort(key=lambda row: float(row.get("ranking_score", 0.0)), reverse=True)
     return relevant_only[:max_results]
+
+
+def _can_fetch_url(url: str) -> bool:
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return False
+    blocked_domains = (
+        "api.open-meteo.com",
+        "geocoding-api.open-meteo.com",
+    )
+    domain = _extract_domain(url)
+    if any(domain.endswith(blocked) for blocked in blocked_domains):
+        return False
+    return True
+
+
+def _passes_deep_research_specificity(query: str, row: dict) -> bool:
+    meaningful_tokens = [
+        token for token in _tokenize(query) if token not in GENERIC_RESEARCH_TOKENS and len(token) >= 3
+    ]
+    if not meaningful_tokens:
+        return float(row.get("query_relevance", 0.0)) >= 0.2
+
+    haystack = (
+        f"{row.get('title', '')} {row.get('snippet', '')} {row.get('url', '')}"
+    ).lower()
+    matched = sum(1 for token in meaningful_tokens if token in haystack)
+    coverage = matched / max(1, len(meaningful_tokens))
+    return coverage >= 0.2 or float(row.get("query_relevance", 0.0)) >= 0.3
+
+
+async def _enrich_results_with_fetch(query: str, docs: list[dict], max_fetch: int = 3) -> list[dict]:
+    if not docs or max_fetch <= 0:
+        return docs
+
+    candidates = [doc for doc in docs if _can_fetch_url(str(doc.get("url") or ""))]
+    if not candidates:
+        return docs
+
+    targets = candidates[:max_fetch]
+    tasks = [
+        asyncio.create_task(_fetch_url_preview(query, str(doc.get("url") or "")))
+        for doc in targets
+    ]
+    fetch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    fetched_by_url: dict[str, dict] = {}
+    for result in fetch_results:
+        if isinstance(result, Exception) or not isinstance(result, dict):
+            continue
+        url = str(result.get("url") or "")
+        if url:
+            fetched_by_url[_normalize_for_dedupe(url)] = result
+
+    if not fetched_by_url:
+        return docs
+
+    enriched: list[dict] = []
+    for doc in docs:
+        current = dict(doc)
+        doc_url = str(current.get("url") or "")
+        key = _normalize_for_dedupe(doc_url)
+        fetched = fetched_by_url.get(key)
+        if fetched:
+            fetched_title = str(fetched.get("title") or "").strip()
+            fetched_snippet = str(fetched.get("snippet") or "").strip()
+            if fetched_title and len(fetched_title) >= 8 and len(str(current.get("title") or "")) < 12:
+                current["title"] = fetched_title
+            if fetched_snippet:
+                current["snippet"] = fetched_snippet
+            current["source"] = f"{current.get('source', 'search')}+fetch"
+            current["fetched"] = True
+        enriched.append(current)
+
+    reranked = _dedupe_and_rank(query, enriched, max_results=len(docs))
+    return reranked or enriched
 
 
 async def search_trusted_sources(query: str, max_results: int = 5) -> list[dict]:
@@ -1268,12 +1403,15 @@ async def search_trusted_sources(query: str, max_results: int = 5) -> list[dict]
     explicit_urls = _extract_explicit_urls(query)
     is_news = _looks_like_news_query(query)
     is_deep_research = _looks_like_deep_research_query(query)
+    search_mode = _get_search_mode()
+    needs_fresh = _needs_fresh_web_data(query)
 
     if _looks_like_weather_query(query):
         weather_docs = await _search_open_meteo_current_weather(query, max_results=max_results)
         if weather_docs:
             for item in weather_docs:
                 item["query_match"] = query[:120]
+                item["pipeline"] = "weather_direct"
             return weather_docs
 
     tasks: list[asyncio.Task] = []
@@ -1281,25 +1419,42 @@ async def search_trusted_sources(query: str, max_results: int = 5) -> list[dict]
     for url in explicit_urls:
         tasks.append(asyncio.create_task(_fetch_url_preview(query, url)))
 
-    # Claude native web-search tool attempt (best-effort)
-    tasks.append(asyncio.create_task(_search_via_claude_web_tool(query, max_results=max_results * 2)))
-
-    for candidate in query_candidates:
-        tasks.append(asyncio.create_task(_search_google_web(candidate, max_results=max_results * 2)))
-        tasks.append(asyncio.create_task(_search_naver_web(candidate, max_results=max_results * 2)))
-        tasks.append(asyncio.create_task(_search_bing_rss(candidate, max_results=max_results * 2)))
+    # A안: Anthropic 공식 web-search tool 경로
+    if search_mode in {"auto", "anthropic"}:
+        # 최신성이 중요한 질의에서는 우선 시도
+        claude_results_limit = max_results * (3 if needs_fresh else 2)
         tasks.append(
-            asyncio.create_task(_search_google_news_rss(candidate, max_results=max_results * 2))
+            asyncio.create_task(_search_via_claude_web_tool(query, max_results=claude_results_limit))
         )
 
-        if is_news:
-            tasks.append(asyncio.create_task(_search_naver_news(candidate, max_results=max_results * 2)))
+    # B안: 커스텀 검색 API/크롤링 경로
+    if search_mode in {"auto", "custom"}:
+        for candidate in query_candidates:
+            if is_deep_research:
+                tasks.append(asyncio.create_task(_search_arxiv_api(candidate, max_results=max_results * 2)))
+                tasks.append(asyncio.create_task(_search_crossref_api(candidate, max_results=max_results * 2)))
+                tasks.append(
+                    asyncio.create_task(
+                        _search_google_web(f"{candidate} research paper arxiv", max_results=max_results * 2)
+                    )
+                )
+                tasks.append(
+                    asyncio.create_task(
+                        _search_bing_rss(f"{candidate} site:arxiv.org OR doi.org", max_results=max_results * 2)
+                    )
+                )
+            else:
+                tasks.append(asyncio.create_task(_search_google_web(candidate, max_results=max_results * 2)))
+                tasks.append(asyncio.create_task(_search_naver_web(candidate, max_results=max_results * 2)))
+                tasks.append(asyncio.create_task(_search_bing_rss(candidate, max_results=max_results * 2)))
+                tasks.append(
+                    asyncio.create_task(_search_google_news_rss(candidate, max_results=max_results * 2))
+                )
 
-        if is_deep_research:
-            tasks.append(asyncio.create_task(_search_arxiv_api(candidate, max_results=max_results * 2)))
-            tasks.append(asyncio.create_task(_search_crossref_api(candidate, max_results=max_results * 2)))
+                if is_news:
+                    tasks.append(asyncio.create_task(_search_naver_news(candidate, max_results=max_results * 2)))
 
-    if _needs_naver_news(query):
+    if search_mode in {"auto", "custom"} and _needs_naver_news(query):
         tasks.append(asyncio.create_task(_search_naver_headlines(query, max_results=max_results * 2)))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1317,11 +1472,16 @@ async def search_trusted_sources(query: str, max_results: int = 5) -> list[dict]
 
     ranked = _dedupe_and_rank(query, merged, max_results=max_results)
 
-    if not ranked and is_news:
+    if not ranked and search_mode in {"auto", "custom"} and is_news:
         # last resort for Korean headline queries
         fallback_naver = await _search_naver_headlines(query, max_results=max_results)
         ranked = _dedupe_and_rank(query, fallback_naver, max_results=max_results)
 
+    # Search -> Fetch 분리: 상위 URL을 실제로 읽어서(snippet/title) 보강 후 재랭킹
+    ranked = await _enrich_results_with_fetch(query, ranked, max_fetch=min(3, max_results))
+    ranked = _dedupe_and_rank(query, ranked, max_results=max_results)
+
     for item in ranked:
         item["query_match"] = query[:120]
+        item["pipeline"] = f"{search_mode}:search_fetch"
     return ranked

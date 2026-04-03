@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends
 
 from app.core.auth import get_current_user_id
+from app.core.default_guideline import DEFAULT_AGENTGCS_GUIDELINE
 from app.core.supabase_client import get_supabase_admin
 from app.models.schemas import (
     ConversationMessageCreateRequest,
@@ -66,6 +67,8 @@ def _normalize_settings(raw: dict | None) -> dict:
         merged["preferred_model"] = None
     if merged.get("knowledge_base_prompt") == "":
         merged["knowledge_base_prompt"] = None
+    if not merged.get("knowledge_base_prompt"):
+        merged["knowledge_base_prompt"] = DEFAULT_AGENTGCS_GUIDELINE
     personas = merged.get("personas")
     if not isinstance(personas, list) or not personas:
         personas = [deepcopy(DEFAULT_PERSONA)]
@@ -292,3 +295,34 @@ async def create_conversation_message(
         return {"item": row, "source": "supabase"}
     except Exception:
         return {"item": local_row, "source": "dev_store"}
+
+
+@router.delete("/conversations/{thread_id}")
+async def delete_conversation(
+    thread_id: str,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    deleted = False
+    source = "dev_store"
+    try:
+        def _delete():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_threads")
+                .delete()
+                .eq("id", thread_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_delete)
+        deleted = bool(result.data)
+        if deleted:
+            source = "supabase"
+    except Exception:
+        pass
+
+    local_deleted = await dev_store.delete_thread(user_id, thread_id)
+    if not deleted:
+        deleted = local_deleted
+    return {"deleted": deleted, "thread_id": thread_id, "source": source}

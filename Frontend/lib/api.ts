@@ -201,6 +201,14 @@ export async function fetchConversationMessages(
   );
 }
 
+export async function deleteConversation(userId: string, threadId: string) {
+  return request<{ deleted: boolean; thread_id: string; source: string }>(
+    `/api/workspace/conversations/${threadId}`,
+    userId,
+    { method: "DELETE" }
+  );
+}
+
 export async function appendConversationMessage(
   userId: string,
   threadId: string,

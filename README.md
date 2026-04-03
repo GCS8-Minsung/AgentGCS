@@ -24,6 +24,9 @@ AgentGCS/
    - 실시간 상태를 WebSocket으로 프론트 전달
    - 결론 후 `notebooklm-mcp-cli` 후처리 호출 (환경 미지원 시 mock)
    - `PersonalAgentService`가 수동 트리거 + 마감 임박 webhook 토스트 생성
+   - 검색 파이프라인: `Search -> Fetch -> Synthesize` 분리 구조
+     - A안(Anthropic Web Search tool) + B안(커스텀 검색 API) 하이브리드
+     - 환경변수 `AGENTGCS_SEARCH_MODE` 로 `auto|anthropic|custom` 전환 가능
 
 3. **Database (Supabase)**
    - `users`, `user_keys`, `tasks`, `agent_logs`

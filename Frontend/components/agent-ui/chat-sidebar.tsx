@@ -1,6 +1,6 @@
 "use client";
 
-import { Clock3, MessageSquare, Plus, Settings, User } from "lucide-react";
+import { Clock3, MessageSquare, Plus, Settings, Trash2, User } from "lucide-react";
 
 export interface SidebarItem {
   id: string;
@@ -22,6 +22,8 @@ interface ChatSidebarProps {
   conversations: ConversationPreview[];
   activeConversationId: string | null;
   onSelectConversation: (conversationId: string) => void;
+  onDeleteConversation: (conversationId: string) => void;
+  onDeleteAllConversations: () => void;
   onOpenSettings: () => void;
   userName?: string | null;
   userEmail?: string | null;
@@ -36,6 +38,8 @@ export function ChatSidebar({
   conversations,
   activeConversationId,
   onSelectConversation,
+  onDeleteConversation,
+  onDeleteAllConversations,
   onOpenSettings,
   userName,
   userEmail,
@@ -110,7 +114,18 @@ export function ChatSidebar({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto border-t border-white/50 pt-4">
-        <p className="mb-2 px-1 text-xs font-semibold tracking-wide text-orange-900/55">이전 대화</p>
+        <div className="mb-2 flex items-center justify-between px-1">
+          <p className="text-xs font-semibold tracking-wide text-orange-900/55">이전 대화</p>
+          {conversations.length > 0 && (
+            <button
+              type="button"
+              onClick={onDeleteAllConversations}
+              className="rounded-md px-2 py-1 text-[10px] font-semibold text-orange-900/70 transition-colors hover:bg-white/65"
+            >
+              전체 삭제
+            </button>
+          )}
+        </div>
         <div className="space-y-2 pr-2 [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-orange-200/50 [&::-webkit-scrollbar-track]:bg-transparent">
           {conversations.length === 0 && (
             <div className="rounded-xl border border-white/70 bg-white/40 px-3 py-2 text-xs text-orange-900/60">
@@ -118,24 +133,37 @@ export function ChatSidebar({
             </div>
           )}
           {conversations.map((conversation) => (
-            <button
+            <div
               key={conversation.id}
-              type="button"
-              onClick={() => onSelectConversation(conversation.id)}
-              className={`w-full rounded-xl border px-3 py-2 text-left transition-all ${
+              className={`flex items-center gap-1 rounded-xl border pr-1 ${
                 activeConversationId === conversation.id
                   ? "border-orange-300 bg-white/90"
                   : "border-white/70 bg-white/45 hover:bg-white/70"
               }`}
             >
-              <p className="truncate text-xs font-semibold text-gray-800">{conversation.title}</p>
-              <p className="mt-1 flex items-center gap-1 text-[10px] text-orange-900/55">
-                <Clock3 className="h-3 w-3" />
-                {conversation.updated_at
-                  ? new Date(conversation.updated_at).toLocaleString()
-                  : "시간 정보 없음"}
-              </p>
-            </button>
+              <button
+                type="button"
+                onClick={() => onSelectConversation(conversation.id)}
+                className="min-w-0 flex-1 px-3 py-2 text-left transition-all"
+              >
+                <p className="truncate text-xs font-semibold text-gray-800">{conversation.title}</p>
+                <p className="mt-1 flex items-center gap-1 text-[10px] text-orange-900/55">
+                  <Clock3 className="h-3 w-3" />
+                  {conversation.updated_at
+                    ? new Date(conversation.updated_at).toLocaleString()
+                    : "시간 정보 없음"}
+                </p>
+              </button>
+              <button
+                type="button"
+                onClick={() => onDeleteConversation(conversation.id)}
+                className="rounded-lg p-2 text-orange-900/55 transition-colors hover:bg-white/70 hover:text-rose-500"
+                aria-label={`${conversation.title} 삭제`}
+                title="대화 삭제"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
           ))}
         </div>
       </div>

@@ -32,6 +32,7 @@ import {
   agentChat,
   bootstrapUser,
   createConversation,
+  deleteConversation,
   fetchConnectionStatus,
   fetchConversationMessages,
   fetchConversations,
@@ -448,6 +449,37 @@ export default function HomePage() {
     },
     [appendAssistantMessage, userId]
   );
+
+  const removeConversation = useCallback(
+    async (threadId: string) => {
+      if (!userId) return;
+      try {
+        const response = await deleteConversation(userId, threadId);
+        if (!response.deleted) {
+          appendAssistantMessage("대화 삭제에 실패했습니다. 잠시 후 다시 시도해주세요.");
+          return;
+        }
+        setConversations((current) => current.filter((conversation) => conversation.id !== threadId));
+      } catch (error) {
+        appendAssistantMessage(`대화 삭제 실패: ${(error as Error).message}`);
+      }
+    },
+    [appendAssistantMessage, userId]
+  );
+
+  const removeAllPreviousConversations = useCallback(async () => {
+    if (!userId || previousConversations.length === 0) return;
+    const ok = window.confirm(`이전 대화 ${previousConversations.length}개를 삭제할까요?`);
+    if (!ok) return;
+    for (const conversation of previousConversations) {
+      try {
+        await deleteConversation(userId, conversation.id);
+      } catch {
+        // ignore per-item delete errors to continue best-effort cleanup
+      }
+    }
+    await refreshConversations(activeConversationId);
+  }, [activeConversationId, previousConversations, refreshConversations, userId]);
 
   const startNewWorkflow = useCallback(async () => {
     if (!userId) return;
@@ -979,6 +1011,12 @@ export default function HomePage() {
             onSelectConversation={(threadId) => {
               void openConversation(threadId);
               setActiveView("multi_agent");
+            }}
+            onDeleteConversation={(threadId) => {
+              void removeConversation(threadId);
+            }}
+            onDeleteAllConversations={() => {
+              void removeAllPreviousConversations();
             }}
             onOpenSettings={() => setSettingsOpen(true)}
             userName={session.fullName}

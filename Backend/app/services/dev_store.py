@@ -5,6 +5,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from app.core.default_guideline import DEFAULT_AGENTGCS_GUIDELINE
+
 
 DEFAULT_PERSONA = {
     "id": "default-balanced",
@@ -25,7 +27,7 @@ DEFAULT_SETTINGS = {
     "debug_raw_mode": False,
     "claude_base_url": "https://claude.1000.school",
     "preferred_model": "gpt-5.2",
-    "knowledge_base_prompt": None,
+    "knowledge_base_prompt": DEFAULT_AGENTGCS_GUIDELINE,
     "chat_mode_personas": {
         "cautious": {
             "creativity": 42,
@@ -182,6 +184,21 @@ class DevStore:
             rows = list(self._threads.get(user_id, {}).values())
             rows.sort(key=lambda row: row.get("updated_at", ""), reverse=True)
             return deepcopy(rows[:limit])
+
+    async def delete_thread(self, user_id: str, thread_id: str) -> bool:
+        async with self._lock:
+            removed = self._threads.setdefault(user_id, {}).pop(thread_id, None)
+            self._messages.pop(thread_id, None)
+            return removed is not None
+
+    async def delete_threads_except(self, user_id: str, keep_thread_id: str | None = None) -> int:
+        async with self._lock:
+            thread_map = self._threads.setdefault(user_id, {})
+            targets = [thread_id for thread_id in thread_map if thread_id != keep_thread_id]
+            for thread_id in targets:
+                thread_map.pop(thread_id, None)
+                self._messages.pop(thread_id, None)
+            return len(targets)
 
     async def ensure_thread(self, user_id: str, thread_id: str | None, title: str | None) -> dict:
         async with self._lock:

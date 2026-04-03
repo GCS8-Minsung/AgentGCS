@@ -6,6 +6,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends
 
 from app.core.config import settings as app_settings
+from app.core.default_guideline import DEFAULT_AGENTGCS_GUIDELINE
 from app.core.security import EncryptedPayload
 from app.core.auth import get_current_user_id
 from app.core.supabase_client import get_supabase_admin
@@ -190,6 +191,7 @@ def _mode_system_instruction(mode: str) -> str:
         "필요 시 도구(웹 검색, 학교 API 컨텍스트)를 활용해 순차적으로 해결한다. "
         "내부 환경 제약을 변명하는 문구(예: '현재 저는 ... 접근 불가')는 출력하지 말고, "
         "실패 시 원인과 재시도 가능한 대안을 간결하게 제시한다."
+        f"\n\n{DEFAULT_AGENTGCS_GUIDELINE}\n"
     )
     if mode == "cautious":
         return base + " 현재 모드는 신중함이다. 가정은 최소화하고 검증 단계를 먼저 제시한다."
@@ -450,6 +452,15 @@ async def _collect_tool_context(user_id: str, message: str) -> list[dict]:
     contexts: list[dict] = []
 
     if _needs_web_search(message) or _needs_multi_agent(message):
+        await personal_agent_service.ws_manager.emit(
+            user_id,
+            "chat.processing",
+            {
+                "stage": "tool_search_started",
+                "tool": "web_search",
+                "message": "웹 검색 파이프라인 실행 중",
+            },
+        )
         sources = await search_trusted_sources(message, max_results=5)
         if sources:
             contexts.append(
@@ -467,6 +478,15 @@ async def _collect_tool_context(user_id: str, message: str) -> list[dict]:
                     "data": {"query": message, "status": "no_results"},
                 }
             )
+        await personal_agent_service.ws_manager.emit(
+            user_id,
+            "chat.processing",
+            {
+                "stage": "tool_search_completed",
+                "tool": "web_search",
+                "result_count": len(sources),
+            },
+        )
 
     if any(keyword in message for keyword in ["회의실", "예약", "meeting room"]):
         try:
@@ -673,13 +693,24 @@ def _build_history_context_text(messages: list[dict], *, max_messages: int = 16,
     tail = usable[-max_messages:]
 
     lines: list[str] = []
+    blocked_phrases = [
+        "실행 가능한 소규모 검증(시장 테스트, 제작비 추정, 초기 고객 인터뷰)을 먼저 배치하고 리스크를 계량화해야 합니다."
+    ]
+
+    def _sanitize(text: str) -> str:
+        sanitized = text
+        for phrase in blocked_phrases:
+            sanitized = sanitized.replace(phrase, "")
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        return sanitized
+
     for msg in tail:
         role = msg.get("role")
         if role == "assistant":
             role_label = "assistant"
         else:
             role_label = "user"
-        content = str(msg.get("content") or "").strip()
+        content = _sanitize(str(msg.get("content") or "").strip())
         if not content:
             continue
         lines.append(f"{role_label}: {content}")
