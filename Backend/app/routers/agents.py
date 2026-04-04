@@ -26,6 +26,10 @@ from app.services.claude_service import ClaudeService
 from app.services.dev_store import dev_store
 from app.services.school_api_client import SchoolApiError, get_school_client_for_user
 from app.tools.web_search import search_trusted_sources
+from app.services.tool_registry import tool_registry
+from app.services.prompt_builder import build_system_prompt
+from app.services.react_engine import ReActEngine
+from app.services.traits import TraitSet
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -830,43 +834,35 @@ async def chat_with_agent(
             "chat.processing",
             {"thread_id": thread["id"], "stage": "multi_agent_reasoning"},
         )
-        task_personas = user_settings.get("personas") or []
-        if not isinstance(task_personas, list):
-            task_personas = []
-        persona_lines: list[str] = []
-        for persona in task_personas[:8]:
-            if not isinstance(persona, dict):
-                continue
-            name = str(persona.get("name") or "에이전트")
-            stats = persona.get("stats") or {}
-            persona_lines.append(f"- {name}: {stats}")
-        if not persona_lines:
-            persona_lines = ["- 기본 에이전트: 균형형 시각으로 분석"]
+        # create a default trait set from user settings or fallback
+        persona_stats = user_settings.get("default_persona_stats") or {}
+        traits = TraitSet.from_dict(persona_stats if isinstance(persona_stats, dict) else {})
+        system_prompt = build_system_prompt(traits, mode=body.mode, knowledge=knowledge_text)
 
-        reply = await user_claude.generate(
-            system_prompt=(
-                _mode_system_instruction(body.mode)
-                + knowledge_text
-                + "\n현재 요청은 멀티 에이전트 토론이 필요하다. "
-                "아래 과제 에이전트들을 활용해 단계별(문제정의->근거검증->대안비교->결론)로 종합 답변하라. "
-                "도구 결과가 주어졌다면 이를 최우선 근거로 사용하고, "
-                "환경 제약(권한 없음/접근 불가) 일반론으로 회피하지 마라. "
-                "이전 대화 맥락이 있다면 이를 반영해 연속성 있게 답변하라."
-            ),
-            user_prompt=(
-                f"{history_block}\n"
-                f"사용자 요청:\n{body.message}\n"
-                f"{stats_text}\n"
-                f"과제 에이전트:\n" + "\n".join(persona_lines) + "\n"
-                f"{tool_context_text}\n"
-                "출력 형식:\n"
-                "1) 에이전트별 핵심 주장 요약\n"
-                "2) 통합 결론\n"
-                "3) 즉시 실행 항목 3개"
-            ),
-            use_mock=body.use_mock,
-            cache_hint=f"chat-multi-agent-{body.mode}",
-        )
+        # run a lightweight ReAct pilot using tool_registry
+        react = ReActEngine(user_claude, tool_registry.call, max_iters=6)
+        pilot_result = await react.run(system_prompt=system_prompt, user_prompt=body.message, use_mock=body.use_mock)
+
+        if pilot_result.get("status") == "completed":
+            reply = pilot_result.get("final") or ""
+        else:
+            # fallback to a single Claude summary
+            reply = await user_claude.generate(
+                system_prompt=(
+                    _mode_system_instruction(body.mode)
+                    + knowledge_text
+                    + "\n현재 요청은 멀티 에이전트 토론이 필요하다. 멀티 에이전트 요약을 생성하라."
+                ),
+                user_prompt=(
+                    f"{history_block}\n"
+                    f"사용자 요청:\n{body.message}\n"
+                    f"{stats_text}\n"
+                    f"도구 결과:\n{tool_context_text}\n"
+                    "출력 형식:\n1) 에이전트별 핵심 주장 요약\n2) 통합 결론\n3) 즉시 실행 항목 3개"
+                ),
+                use_mock=body.use_mock,
+                cache_hint=f"chat-multi-agent-fallback-{body.mode}",
+            )
     else:
         reply = await user_claude.generate(
             system_prompt=(
