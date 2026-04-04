@@ -915,14 +915,23 @@ export default function HomePage() {
     try {
       const notifyCandidate = userEmail ?? undefined;
       const notifyEmail = isValidEmail(notifyCandidate) ? notifyCandidate : undefined;
-      const response = await startDeepTask({
-        userId,
+
+      const orchestratorPayload = {
         task: trimmedTask,
-        personaStats: activeTaskPersona?.stats ?? DEFAULT_STATS,
-        notifyEmail,
-        useMock: settings.dev_mode || !connectionStatus?.claude.reachable
-      });
-      setActiveRunId(response.run_id);
+        persona_count: Math.max(3, settings.personas.length),
+        use_mock: settings.dev_mode || !connectionStatus?.claude.reachable
+      };
+
+      const orchestratorResp = await request<{ run_id: string }>(
+        "/api/orchestrator/run",
+        userId,
+        {
+          method: "POST",
+          body: JSON.stringify(orchestratorPayload)
+        },
+        420000
+      );
+      setActiveRunId(orchestratorResp.run_id ?? null);
     } catch (error) {
       setRunning(false);
       appendAssistantMessage(`과제 자동화 요청 실패: ${(error as Error).message}`);

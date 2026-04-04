@@ -80,6 +80,33 @@ export async function startDeepTask(params: {
   });
 }
 
+export async function orchestratorRun(params: {
+  userId: string;
+  task: string;
+  persona_count?: number;
+  useMock?: boolean;
+}) {
+  return request<{
+    run_id: string;
+    summary?: string;
+    notebook?: any;
+    pptx?: string;
+    drive?: any;
+  }>(
+    "/api/orchestrator/run",
+    params.userId,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        task: params.task,
+        persona_count: params.persona_count ?? 4,
+        use_mock: params.useMock ?? false
+      })
+    },
+    420000
+  );
+}
+
 export async function triggerPersonalAgent(params: {
   userId: string;
   instruction: string;
