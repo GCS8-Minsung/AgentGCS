@@ -9,9 +9,9 @@ from app.core.config import settings as app_settings
 from app.core.default_guideline import DEFAULT_AGENTGCS_GUIDELINE
 from app.core.security import EncryptedPayload
 from app.core.auth import get_current_user_id
-from app.core.supabase_client import get_supabase_admin
+from app.core.supabase_client import get_supabase_admin, save_agent_log
 from app.dependencies import (
-    deep_task_orchestrator,
+    context_manager,
     personal_agent_service,
     security_manager,
 )
@@ -19,17 +19,17 @@ from app.models.schemas import (
     AgentChatRequest,
     DeepTaskRequest,
     DeepTaskStartResponse,
+    PersonaStats,
     PersonalAgentTriggerRequest,
     PersonalSchoolActionRequest,
 )
-from app.services.claude_service import ClaudeService
+from app.services.claude_service import AgentPipeline, ClaudeService, ClaudeServiceError
+from app.services.chatbot_service import ChatBotService
 from app.services.dev_store import dev_store
+from app.services.integrations import diagnose_google_workspace
 from app.services.school_api_client import SchoolApiError, get_school_client_for_user
 from app.tools.web_search import search_trusted_sources
 from app.services.tool_registry import tool_registry
-from app.services.prompt_builder import build_system_prompt
-from app.services.react_engine import ReActEngine
-from app.services.traits import TraitSet
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -110,23 +110,44 @@ def _decrypt_key(row: dict | None, user_id: str) -> str | None:
         return None
 
 
-async def _build_user_claude_service(user_id: str) -> ClaudeService:
+async def _build_user_claude_service(
+    user_id: str,
+    *,
+    ai_provider_override: str | None = None,
+    claude_model_override: str | None = None,
+    openai_model_override: str | None = None,
+) -> ClaudeService:
     user_settings = await _get_user_settings(user_id)
-    claude_base = user_settings.get("claude_base_url") or app_settings.anthropic_base_url
-    preferred_model = user_settings.get("preferred_model") or app_settings.claude_model
+    ai_provider = str(ai_provider_override or user_settings.get("ai_provider") or "claude").lower()
+    if ai_provider not in {"claude", "openai"}:
+        ai_provider = "claude"
+    claude_base = (
+        user_settings.get("claude_base_url")
+        or app_settings.anthropic_base_url
+        or "https://claude.1000.school"
+    )
+    if ai_provider == "openai":
+        preferred_model = (
+            (openai_model_override or "").strip()
+            or user_settings.get("openai_preferred_model")
+            or app_settings.openai_fallback_model
+            or "gpt-5-mini"
+        )
+    else:
+        preferred_model = (
+            (claude_model_override or "").strip()
+            or user_settings.get("preferred_model")
+            or app_settings.claude_model
+        )
 
     school_token = _decrypt_key(await _get_user_key_row(user_id, "school_api_token"), user_id)
     anthropic_token = _decrypt_key(
         await _get_user_key_row(user_id, "anthropic_auth_token"), user_id
     )
     claude_api_key = _decrypt_key(await _get_user_key_row(user_id, "claude_api_key"), user_id)
+    openai_api_key = _decrypt_key(await _get_user_key_row(user_id, "openai_api_key"), user_id)
 
-    auth_token = (
-        anthropic_token
-        or school_token
-        or app_settings.anthropic_auth_token
-        or app_settings.school_api_token
-    )
+    auth_token = anthropic_token or school_token or app_settings.anthropic_auth_token
     api_key = claude_api_key or app_settings.claude_api_key
 
     return ClaudeService(
@@ -134,7 +155,67 @@ async def _build_user_claude_service(user_id: str) -> ClaudeService:
         auth_token=auth_token,
         base_url=claude_base,
         preferred_model=preferred_model,
+        openai_api_key=openai_api_key or app_settings.openai_api_key,
+        openai_fallback_url=app_settings.openai_fallback_url,
+        openai_fallback_model=app_settings.openai_fallback_model,
+        primary_provider=ai_provider,
     )
+
+
+async def _run_pipeline_background(
+    *,
+    user_id: str,
+    run_id: str,
+    task: str,
+    persona_stats: PersonaStats,
+    knowledge: str,
+    use_mock: bool,
+) -> None:
+    user_claude = await _build_user_claude_service(user_id)
+    pipeline = AgentPipeline(
+        claude=user_claude,
+        tool_call=tool_registry.call,
+        ws_emit=personal_agent_service.ws_manager.emit,
+        max_retries=3,
+    )
+    try:
+        trace = await pipeline.run(
+            user_id=user_id,
+            mode="autonomous",
+            message=task,
+            persona_stats=persona_stats.model_dump(),
+            knowledge=knowledge,
+            thread_id=run_id,
+            use_mock=use_mock,
+        )
+        await personal_agent_service.ws_manager.emit(
+            user_id,
+            "deep_task.completed",
+            {
+                "final_summary": trace.final_markdown,
+                "arguments": {
+                    row.step_id: {
+                        "tool": row.tool,
+                        "status": row.status,
+                        "error": row.error,
+                    }
+                    for row in trace.execution_results
+                },
+                "sources": [
+                    row.result
+                    for row in trace.execution_results
+                    if row.status == "ok" and isinstance(row.result, dict)
+                ][:20],
+            },
+            run_id=run_id,
+        )
+    except Exception as exc:
+        await personal_agent_service.ws_manager.emit(
+            user_id,
+            "deep_task.failed",
+            {"message": str(exc)},
+            run_id=run_id,
+        )
 
 
 @router.post("/deep-task/start", response_model=DeepTaskStartResponse)
@@ -144,13 +225,16 @@ async def start_deep_task(
     user_id: str = Depends(get_current_user_id),
 ) -> DeepTaskStartResponse:
     run_id = str(uuid4())
-    user_claude = await _build_user_claude_service(user_id)
+    user_settings = await _get_user_settings(user_id)
+    knowledge = str(user_settings.get("knowledge_base_prompt") or "")
     background_tasks.add_task(
-        deep_task_orchestrator.run_and_stream,
+        _run_pipeline_background,
         user_id=user_id,
         run_id=run_id,
-        request=body,
-        claude_override=user_claude,
+        task=body.task,
+        persona_stats=body.persona_stats,
+        knowledge=knowledge,
+        use_mock=body.use_mock,
     )
     return DeepTaskStartResponse(
         run_id=run_id,
@@ -166,7 +250,12 @@ async def trigger_personal_agent(
 ) -> dict:
     current_settings = await _get_user_settings(user_id)
     use_mock = bool(current_settings.get("dev_mode", False))
-    user_claude = await _build_user_claude_service(user_id)
+    user_claude = await _build_user_claude_service(
+        user_id,
+        ai_provider_override=body.ai_provider,
+        claude_model_override=body.claude_model,
+        openai_model_override=body.openai_model,
+    )
     return await personal_agent_service.trigger_manual(
         user_id=user_id,
         instruction=body.instruction,
@@ -728,9 +817,124 @@ def _build_history_context_text(messages: list[dict], *, max_messages: int = 16,
     return text
 
 
+def _trim_text(text: str, max_len: int) -> str:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max(0, max_len - 3)] + "..."
+
+
+def _build_compact_qa_memory(messages: list[dict], *, max_pairs: int = 5) -> list[dict[str, str]]:
+    if not messages:
+        return []
+    pairs: list[dict[str, str]] = []
+    pending_user: str | None = None
+    for row in messages:
+        role = str(row.get("role") or "")
+        content = _trim_text(str(row.get("content") or ""), 720)
+        if not content:
+            continue
+        if role == "user":
+            pending_user = content
+            continue
+        if role == "assistant" and pending_user:
+            pairs.append(
+                {
+                    "user": _trim_text(pending_user, 220),
+                    "assistant": _trim_text(content, 340),
+                }
+            )
+            pending_user = None
+    return pairs[-max_pairs:]
+
+
+def _format_qa_memory_block(pairs: list[dict[str, str]]) -> str:
+    if not pairs:
+        return ""
+    lines = ["최근 대화 요약(최대 5세트):"]
+    for idx, pair in enumerate(pairs, start=1):
+        lines.append(f"{idx}. Q: {pair.get('user', '')}")
+        lines.append(f"   A: {pair.get('assistant', '')}")
+    return "\n".join(lines)
+
+
+def _resolve_mode_stats(settings: dict, mode: str) -> dict[str, int]:
+    chat_mode_personas = settings.get("chat_mode_personas")
+    if isinstance(chat_mode_personas, dict):
+        mode_stats = chat_mode_personas.get(mode)
+        if isinstance(mode_stats, dict):
+            return mode_stats
+    return {
+        "creativity": 70,
+        "logic": 75,
+        "critical_thinking": 75,
+        "data_dependency": 70,
+        "cautiousness": 60,
+        "drive": 75,
+    }
+
+
+def _is_complex_request(message: str, mode: str) -> bool:
+    if mode == "autonomous":
+        return True
+    msg = (message or "").strip()
+    if len(msg) >= 280:
+        return True
+    if _needs_multi_agent(msg) or _needs_web_search(msg) or _looks_like_api_action(msg):
+        return True
+    complex_markers = [
+        "계획",
+        "전략",
+        "분석",
+        "비교",
+        "근거",
+        "리스크",
+        "자동화",
+        "워크플로우",
+        "pipeline",
+        "react",
+        "plan-and-execute",
+    ]
+    lowered = msg.lower()
+    return any(marker in msg or marker in lowered for marker in complex_markers)
+
+
+def _select_contextual_knowledge(
+    knowledge_text: str,
+    *,
+    message: str,
+    qa_memory_block: str,
+    is_complex: bool,
+) -> str:
+    base = _trim_text(knowledge_text or "", 700)
+    sections: list[str] = []
+    if base:
+        sections.append(base)
+    if qa_memory_block:
+        sections.append(_trim_text(qa_memory_block, 1600))
+    if not is_complex:
+        return "\n\n".join(section for section in sections if section).strip()
+
+    # Complex request: add keyword-matching snippets from long knowledge.
+    lines = [line.strip() for line in (knowledge_text or "").splitlines() if line.strip()]
+    tokens = set(re.findall(r"[A-Za-z0-9가-힣]{2,}", message.lower()))
+    matched: list[str] = []
+    for line in lines:
+        lowered = line.lower()
+        if any(token in lowered for token in tokens):
+            matched.append(line)
+        if len(matched) >= 12:
+            break
+    if matched:
+        sections.append("관련 사전지식:\n" + "\n".join(f"- {item}" for item in matched))
+    merged = "\n\n".join(section for section in sections if section).strip()
+    return _trim_text(merged, 3200)
+
+
 @router.post("/chat")
 async def chat_with_agent(
     body: AgentChatRequest,
+    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     title = body.title or body.message[:30] or "새 대화"
@@ -752,147 +956,149 @@ async def chat_with_agent(
     recent_messages = await _list_recent_thread_messages(
         user_id=user_id,
         thread_id=thread["id"],
-        limit=28,
+        limit=40,
     )
-    history_text = _build_history_context_text(recent_messages)
-    history_block = (
-        f"\n이전 대화 맥락(최근 히스토리):\n{history_text}\n"
-        if history_text
-        else ""
-    )
+    session_context_id = f"{user_id}:{thread['id']}"
+    await context_manager.hydrate_if_empty(session_context_id, recent_messages)
+    cached_context = await context_manager.get_context(session_context_id)
+    if not cached_context or cached_context[-1].get("role") != "user" or str(
+        cached_context[-1].get("content") or ""
+    ) != body.message:
+        await context_manager.append_message(
+            session_context_id,
+            role="user",
+            content=body.message,
+        )
+
+    history_text = _build_history_context_text(recent_messages, max_messages=24, max_chars=2400)
+    qa_memory_pairs = _build_compact_qa_memory(recent_messages, max_pairs=5)
+    qa_memory_block = _format_qa_memory_block(qa_memory_pairs)
 
     user_settings = await _get_user_settings(user_id)
-    stats_text = ""
-    if body.persona_stats:
-        stats_text = (
-            "\n참고 페르소나 성향(0~100): "
-            + str(body.persona_stats.model_dump())
-            + "\n이 성향에 맞춰 톤과 우선순위를 조절해 답변하라."
+    stats_model = body.persona_stats or PersonaStats(**_resolve_mode_stats(user_settings, body.mode))
+    is_complex_request = _is_complex_request(body.message, body.mode)
+
+    user_claude = await _build_user_claude_service(
+        user_id,
+        ai_provider_override=body.ai_provider,
+        claude_model_override=body.claude_model,
+        openai_model_override=body.openai_model,
+    )
+    raw_knowledge_text = (body.knowledge_prompt or user_settings.get("knowledge_base_prompt") or "").strip()
+    contextual_knowledge = _select_contextual_knowledge(
+        raw_knowledge_text,
+        message=body.message,
+        qa_memory_block=qa_memory_block,
+        is_complex=is_complex_request,
+    )
+    debug_raw_mode = bool(body.debug_raw or user_settings.get("debug_raw_mode", False))
+    tool_contexts: list[dict] = []
+    run_id: str | None = None
+    needs_multi_agent = body.mode == "autonomous"
+    intent_summary: dict | None = None
+    try:
+        chatbot = ChatBotService(
+            context_manager=context_manager,
+            ws_emit=personal_agent_service.ws_manager.emit,
+        )
+        run_result = await chatbot.handle_message(
+            user_id=user_id,
+            session_id=session_context_id,
+            message=body.message,
+            mode=body.mode,
+            persona_stats=stats_model.model_dump(),
+            knowledge_text=contextual_knowledge,
+            claude=user_claude,
+            tool_call=tool_registry.call,
+            use_mock=body.use_mock,
+        )
+        run_id = run_result.run_id
+        reply = run_result.reply
+        tool_contexts = run_result.tool_contexts
+        intent_summary = {
+            "intent": run_result.intent.intent,
+            "confidence": run_result.intent.confidence,
+            "reason": run_result.intent.reason,
+            "tools": run_result.intent.tools,
+        }
+
+        await context_manager.append_message(
+            session_context_id,
+            role="assistant",
+            content=reply,
         )
 
-    user_claude = await _build_user_claude_service(user_id)
-    knowledge_text = (body.knowledge_prompt or "").strip()
-    if knowledge_text:
-        knowledge_text = f"\n사전 지식:\n{knowledge_text}\n"
-
-    tool_context_task = asyncio.create_task(_collect_tool_context(user_id, body.message))
-    api_actions_task = asyncio.create_task(_execute_school_api_actions(user_id, body.message))
-    tool_contexts, api_actions = await asyncio.gather(tool_context_task, api_actions_task)
-
-    if api_actions:
-        await personal_agent_service.ws_manager.emit(
-            user_id,
-            "chat.processing",
-            {
-                "thread_id": thread["id"],
-                "stage": "api_actions_done",
-                "actions": [action.get("action") for action in api_actions],
-            },
-        )
-    if api_actions:
-        tool_contexts.append(
-            {
-                "tool": "school_api_actions",
-                "summary": "사용자 요청 기반 API 액션 실행 결과",
-                "data": api_actions,
-            }
-        )
-    if tool_contexts:
-        await personal_agent_service.ws_manager.emit(
-            user_id,
-            "chat.processing",
-            {
-                "thread_id": thread["id"],
-                "stage": "tool_context_ready",
-                "tools": [ctx["tool"] for ctx in tool_contexts],
-            },
-        )
-    tool_context_text = ""
-    if tool_contexts:
-        compact_contexts = []
-        for ctx in tool_contexts:
-            compact_contexts.append(
+        try:
+            sources: list[dict] = []
+            for ctx in tool_contexts:
+                data = ctx.get("data")
+                if isinstance(data, list):
+                    sources.extend([item for item in data if isinstance(item, dict)])
+                elif isinstance(data, dict):
+                    sources.append(data)
+            await save_agent_log(
                 {
-                    "tool": ctx.get("tool"),
-                    "summary": ctx.get("summary"),
-                    "data": ctx.get("data"),
+                    "run_id": run_id,
+                    "user_id": user_id,
+                    "task": body.message,
+                    "persona_stats": stats_model.model_dump(),
+                    "arguments": {"intent": intent_summary or {}},
+                    "final_summary": reply,
+                    "sources": sources[:32],
+                    "feedback_score": None,
                 }
             )
-        tool_context_text = "\n도구 결과(JSON):\n" + json.dumps(
-            compact_contexts, ensure_ascii=False
+        except Exception:
+            pass
+    except ClaudeServiceError as exc:
+        reply = (
+            "AI 호출 실패\n"
+            f"- code: `{exc.code}`\n"
+            f"- message: {str(exc)}\n"
+            "토큰 권한/쿼터/게이트웨이 상태를 점검해주세요."
         )
-
-    explicit_tool_result_mode = _is_explicit_tool_result_request(body.message)
-    needs_multi_agent = _needs_multi_agent(body.message)
-    debug_raw_mode = bool(body.debug_raw or user_settings.get("debug_raw_mode", False))
-
-    if explicit_tool_result_mode and api_actions and not needs_multi_agent:
-        reply = _format_school_api_action_reply(api_actions)
-    elif needs_multi_agent:
-        await personal_agent_service.ws_manager.emit(
-            user_id,
-            "chat.processing",
-            {"thread_id": thread["id"], "stage": "multi_agent_reasoning"},
-        )
-        # create a default trait set from user settings or fallback
-        persona_stats = user_settings.get("default_persona_stats") or {}
-        traits = TraitSet.from_dict(persona_stats if isinstance(persona_stats, dict) else {})
-        system_prompt = build_system_prompt(traits, mode=body.mode, knowledge=knowledge_text)
-
-        # run a lightweight ReAct pilot using tool_registry
-        react = ReActEngine(user_claude, tool_registry.call, max_iters=6)
-        pilot_result = await react.run(system_prompt=system_prompt, user_prompt=body.message, use_mock=body.use_mock)
-
-        if pilot_result.get("status") == "completed":
-            reply = pilot_result.get("final") or ""
-        else:
-            # fallback to a single Claude summary
-            reply = await user_claude.generate(
-                system_prompt=(
-                    _mode_system_instruction(body.mode)
-                    + knowledge_text
-                    + "\n현재 요청은 멀티 에이전트 토론이 필요하다. 멀티 에이전트 요약을 생성하라."
-                ),
-                user_prompt=(
-                    f"{history_block}\n"
-                    f"사용자 요청:\n{body.message}\n"
-                    f"{stats_text}\n"
-                    f"도구 결과:\n{tool_context_text}\n"
-                    "출력 형식:\n1) 에이전트별 핵심 주장 요약\n2) 통합 결론\n3) 즉시 실행 항목 3개"
-                ),
-                use_mock=body.use_mock,
-                cache_hint=f"chat-multi-agent-fallback-{body.mode}",
-            )
-    else:
-        reply = await user_claude.generate(
-            system_prompt=(
-                _mode_system_instruction(body.mode)
-                + knowledge_text
-                + "\n도구 결과가 주어졌다면 해당 결과를 근거로 답변하라. "
-                "키 접근 불가/외부 API 접근 불가 같은 일반적 변명을 하지 마라. "
-                "이전 대화 맥락이 있다면 이어지는 답변으로 작성하라."
-            ),
-            user_prompt=f"{history_block}\n사용자 요청:\n{body.message}\n{stats_text}{tool_context_text}",
-            use_mock=body.use_mock,
-            cache_hint=f"chat-{body.mode}",
-        )
+        tool_contexts = [
+            {
+                "tool": "pipeline_error",
+                "summary": "pipeline failed",
+                "data": {
+                    "code": exc.code,
+                    "retryable": exc.retryable,
+                    "status_code": exc.status_code,
+                    "details": exc.details,
+                },
+            }
+        ]
+    except Exception as exc:
+        reply = f"파이프라인 실행 실패: {str(exc)}"
+        tool_contexts = [
+            {
+                "tool": "pipeline_error",
+                "summary": "unexpected pipeline failure",
+                "data": {"error": str(exc)},
+            }
+        ]
 
     if debug_raw_mode:
         debug_payload = {
             "thread_id": thread["id"],
+            "run_id": run_id,
             "mode": body.mode,
             "message": body.message,
             "needs_multi_agent": needs_multi_agent,
-            "explicit_tool_result_mode": explicit_tool_result_mode,
             "use_mock": body.use_mock,
             "claude": {
                 "base_url": user_claude.base_url,
                 "preferred_model": user_claude.preferred_model,
+                "primary_provider": user_claude.primary_provider,
             },
             "knowledge_prompt": body.knowledge_prompt,
+            "contextual_knowledge": contextual_knowledge,
+            "is_complex_request": is_complex_request,
+            "intent": intent_summary,
+            "qa_memory_pairs": qa_memory_pairs,
             "history_context": history_text,
             "tool_contexts": tool_contexts,
-            "api_actions": api_actions,
             "generated_reply": reply,
         }
         reply = _as_json_markdown(debug_payload)
@@ -905,8 +1111,8 @@ async def chat_with_agent(
         metadata={
             "mode": body.mode,
             "multi_agent": needs_multi_agent,
+            "run_id": run_id,
             "tools": [ctx["tool"] for ctx in tool_contexts],
-            "explicit_tool_result_mode": explicit_tool_result_mode,
             "debug_raw_mode": debug_raw_mode,
         },
     )
@@ -927,6 +1133,7 @@ async def chat_with_agent(
 async def get_connection_status(user_id: str = Depends(get_current_user_id)) -> dict:
     user_claude = await _build_user_claude_service(user_id)
     claude = await user_claude.diagnose_connection()
+    openai = await user_claude.diagnose_openai_connection()
 
     async def _find_key_exists(key_name: str) -> bool:
         try:
@@ -952,6 +1159,8 @@ async def get_connection_status(user_id: str = Depends(get_current_user_id)) -> 
 
     school_key_found = await _find_key_exists("school_api_token")
     google_key_found = await _find_key_exists("google_oauth_access_token")
+    google_refresh_found = await _find_key_exists("google_oauth_refresh_token")
+    openai_key_found = await _find_key_exists("openai_api_key")
 
     school_api = {
         "token_saved": school_key_found,
@@ -1007,9 +1216,50 @@ async def get_connection_status(user_id: str = Depends(get_current_user_id)) -> 
             "reason": str(exc)[:180],
         }
 
+    google_workspace = await diagnose_google_workspace(user_id)
+    if not google_workspace.get("token_saved"):
+        google_workspace["token_saved"] = bool(google_key_found or google_refresh_found)
+
+    web_search = {"reachable": False, "status": "error", "result_count": 0}
+    try:
+        probe_sources = await search_trusted_sources("오늘 서울 날씨", max_results=1)
+        web_search = {
+            "reachable": len(probe_sources) > 0,
+            "status": "ok" if probe_sources else "no_results",
+            "result_count": len(probe_sources),
+        }
+    except Exception as exc:
+        web_search = {
+            "reachable": False,
+            "status": "error",
+            "reason": str(exc)[:180],
+            "result_count": 0,
+        }
+
+    tools_catalog = {"builtin_count": 0, "openapi_count": 0}
+    try:
+        catalog = await tool_registry.call("list_tools", {}, user_id)
+        builtin = catalog.get("builtin_tools") if isinstance(catalog, dict) else []
+        openapi = catalog.get("openapi_tools") if isinstance(catalog, dict) else []
+        tools_catalog = {
+            "builtin_count": len(builtin) if isinstance(builtin, list) else 0,
+            "openapi_count": len(openapi) if isinstance(openapi, list) else 0,
+        }
+    except Exception:
+        pass
+
     return {
         "claude": claude,
         "school_api": school_api,
-        "google_workspace": {"token_saved": google_key_found},
+        "google_workspace": google_workspace,
+        "openai_fallback": {
+            "token_saved": openai_key_found or bool(app_settings.openai_api_key),
+            "reachable": openai.get("reachable", False),
+            "status": openai.get("status", "not_configured"),
+            "model": openai.get("model"),
+        },
+        "active_provider": user_claude.primary_provider,
         "database": database,
+        "web_search": web_search,
+        "tools_catalog": tools_catalog,
     }

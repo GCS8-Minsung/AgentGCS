@@ -16,6 +16,7 @@ import {
   ApiKeyMeta,
   AutonomyMode,
   ClaudeConnectionStatus,
+  normalizePersonaStats,
   PERSONA_AXES,
   PersonaProfile,
   PersonaStats,
@@ -32,7 +33,26 @@ type ConnectionSnapshot = {
     reason?: string | null;
     source?: "user_key" | "env_fallback" | "none";
   };
-  google_workspace: { token_saved: boolean };
+  google_workspace: {
+    token_saved: boolean;
+    reachable?: boolean;
+    status?: string;
+    reason?: string | null;
+    oauth_configured?: boolean;
+    token_expired?: boolean;
+    refresh_available?: boolean;
+    services?: {
+      drive?: { status?: string; http_status?: number; reason?: string };
+      gmail?: { status?: string; http_status?: number; reason?: string };
+      calendar?: { status?: string; http_status?: number; reason?: string };
+    };
+  };
+  openai_fallback?: {
+    token_saved: boolean;
+    reachable?: boolean;
+    status?: string;
+    model?: string;
+  };
   database?: { connected: boolean; source: "supabase" | "dev_store"; reason?: string | null };
 };
 
@@ -54,7 +74,7 @@ const EMPTY_STATS: PersonaStats = {
   logic: 76,
   critical_thinking: 79,
   data_dependency: 71,
-  empathy: 48,
+  cautiousness: 48,
   drive: 84
 };
 
@@ -65,10 +85,10 @@ const CHAT_MODE_LABELS: Record<AutonomyMode, string> = {
   autonomous: "완전자율"
 };
 
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const GOOGLE_CLIENT_ID =
   process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ??
   "513803184584-7sb5sp4qv68a534kvd0u3inp0ruf021r.apps.googleusercontent.com";
-
 const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/calendar.events",
@@ -130,17 +150,28 @@ function normalizeChatModePersonas(
   source: Partial<Record<AutonomyMode, PersonaStats>> | undefined
 ): Record<AutonomyMode, PersonaStats> {
   return {
-    cautious: source?.cautious ?? { ...EMPTY_STATS },
-    balanced: source?.balanced ?? { ...EMPTY_STATS },
-    creative: source?.creative ?? { ...EMPTY_STATS },
-    autonomous: source?.autonomous ?? { ...EMPTY_STATS }
+    cautious: normalizePersonaStats(source?.cautious ?? EMPTY_STATS),
+    balanced: normalizePersonaStats(source?.balanced ?? EMPTY_STATS),
+    creative: normalizePersonaStats(source?.creative ?? EMPTY_STATS),
+    autonomous: normalizePersonaStats(source?.autonomous ?? EMPTY_STATS)
   };
 }
 
+function extractBearerToken(raw: string): string {
+  const text = raw.trim();
+  if (!text) return "";
+  const bearerMatch = text.match(/Bearer\s+([A-Za-z0-9._\-]+)/i);
+  if (bearerMatch?.[1]) return bearerMatch[1].trim();
+  const keyMatch = text.match(/(sk-[A-Za-z0-9._\-]+)/);
+  if (keyMatch?.[1]) return keyMatch[1].trim();
+  return text;
+}
+
 function MiniRadarPreview({ value }: { value: PersonaStats }) {
+  const normalized = useMemo(() => normalizePersonaStats(value), [value]);
   const data = useMemo(
-    () => PERSONA_AXES.map((axis) => ({ axis: axis.label, value: value[axis.key] })),
-    [value]
+    () => PERSONA_AXES.map((axis) => ({ axis: axis.label, value: normalized[axis.key] })),
+    [normalized]
   );
   return (
     <div className="h-[140px] w-full">
@@ -177,6 +208,9 @@ export const SettingsModal = memo(function SettingsModal({
   const [saving, setSaving] = useState(false);
   const [savingKey, setSavingKey] = useState(false);
   const [schoolApiToken, setSchoolApiToken] = useState("");
+  const [openAiApiToken, setOpenAiApiToken] = useState("");
+  const [googleClientIdInput, setGoogleClientIdInput] = useState("");
+  const [googleClientSecretInput, setGoogleClientSecretInput] = useState("");
   const [googleReady, setGoogleReady] = useState(false);
   const [googleConnecting, setGoogleConnecting] = useState(false);
   const [dbConnecting, setDbConnecting] = useState(false);
@@ -186,15 +220,25 @@ export const SettingsModal = memo(function SettingsModal({
   const [localSavedKeyNames, setLocalSavedKeyNames] = useState<string[]>([]);
   const [activeChatMode, setActiveChatMode] = useState<AutonomyMode>("balanced");
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const selectedProvider = draftSettings.ai_provider ?? "claude";
 
   useEffect(() => {
     if (!open) return;
+    const normalizedPersonas = (settings.personas ?? []).map((persona) => ({
+      ...persona,
+      stats: normalizePersonaStats(persona.stats)
+    }));
     setDraftSettings({
       ...settings,
+      personas: normalizedPersonas.length > 0 ? normalizedPersonas : settings.personas,
       chat_mode_personas: normalizeChatModePersonas(settings.chat_mode_personas)
     });
     setStatusText(null);
     setLocalSavedKeyNames([]);
+    setSchoolApiToken("");
+    setOpenAiApiToken("");
+    setGoogleClientIdInput("");
+    setGoogleClientSecretInput("");
     setActiveChatMode("balanced");
     try {
       const raw = localStorage.getItem(`agentgcs_saved_keys_${userId}`);
@@ -234,7 +278,6 @@ export const SettingsModal = memo(function SettingsModal({
       setGoogleReady(true);
       return;
     }
-
     const script = document.createElement("script");
     script.src = "https://accounts.google.com/gsi/client";
     script.async = true;
@@ -242,10 +285,47 @@ export const SettingsModal = memo(function SettingsModal({
     script.onload = () => setGoogleReady(true);
     script.onerror = () => setGoogleReady(false);
     document.head.appendChild(script);
-    return () => {
-      script.remove();
-    };
+    return () => script.remove();
   }, [open]);
+
+  useEffect(() => {
+    const markSaved = (keyName: string) => {
+      setLocalSavedKeyNames((current) => {
+        const next = Array.from(new Set([...current, keyName]));
+        try {
+          localStorage.setItem(`agentgcs_saved_keys_${userId}`, JSON.stringify(next));
+        } catch {
+          // ignore local storage errors
+        }
+        return next;
+      });
+    };
+    const backendOrigin = (() => {
+      try {
+        return new URL(BACKEND_URL).origin;
+      } catch {
+        return null;
+      }
+    })();
+    const handler = (event: MessageEvent) => {
+      if (backendOrigin && event.origin !== backendOrigin) return;
+      const payload = event.data as
+        | { type?: string; status?: string; message?: string }
+        | undefined;
+      if (!payload || payload.type !== "agentgcs_google_oauth_result") return;
+      setGoogleConnecting(false);
+      if (payload.status === "success") {
+        markSaved("google_oauth_access_token");
+        markSaved("google_oauth_token_meta");
+        setStatusText(payload.message ?? "Google Workspace OAuth 연결이 완료되었습니다.");
+      } else {
+        setStatusText(payload.message ?? "Google Workspace OAuth 연결에 실패했습니다.");
+      }
+      void onRefreshConnectionStatus();
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [onRefreshConnectionStatus, userId]);
 
   const keyNames = useMemo(() => {
     const names = new Set(apiKeys.map((key) => key.key_name));
@@ -254,9 +334,11 @@ export const SettingsModal = memo(function SettingsModal({
     }
     if (connectionStatus?.school_api.token_saved) names.add("school_api_token");
     if (connectionStatus?.google_workspace.token_saved) names.add("google_oauth_access_token");
+    if (connectionStatus?.openai_fallback?.token_saved) names.add("openai_api_key");
     return Array.from(names).sort();
   }, [
     apiKeys,
+    connectionStatus?.openai_fallback?.token_saved,
     connectionStatus?.google_workspace.token_saved,
     connectionStatus?.school_api.token_saved,
     localSavedKeyNames
@@ -264,7 +346,11 @@ export const SettingsModal = memo(function SettingsModal({
 
   const hasGoogleToken =
     keyNames.includes("google_oauth_access_token") ||
+    keyNames.includes("google_oauth_refresh_token") ||
     Boolean(connectionStatus?.google_workspace.token_saved);
+  const hasOpenAiFallbackKey =
+    keyNames.includes("openai_api_key") ||
+    Boolean(connectionStatus?.openai_fallback?.token_saved);
   const availableModels = useMemo(() => {
     const raw = connectionStatus?.claude.available_models ?? [];
     if (!Array.isArray(raw) || raw.length === 0) {
@@ -323,7 +409,15 @@ export const SettingsModal = memo(function SettingsModal({
     setDraftSettings((current) => ({
       ...current,
       personas: current.personas.map((persona) =>
-        persona.id === personaId ? { ...persona, ...patch } : persona
+        persona.id === personaId
+          ? {
+              ...persona,
+              ...patch,
+              stats: patch.stats
+                ? normalizePersonaStats(patch.stats)
+                : normalizePersonaStats(persona.stats)
+            }
+          : persona
       )
     }));
   }, []);
@@ -342,7 +436,7 @@ export const SettingsModal = memo(function SettingsModal({
         ...current,
         chat_mode_personas: {
           ...current.chat_mode_personas,
-          [mode]: nextStats
+          [mode]: normalizePersonaStats(nextStats)
         }
       }));
     },
@@ -377,67 +471,94 @@ export const SettingsModal = memo(function SettingsModal({
   }, []);
 
   const connectGoogleWorkspace = useCallback(async () => {
-    const googleWindow = window as GoogleWindow;
-    if (!googleWindow.google?.accounts?.oauth2) {
-      setStatusText("Google OAuth 스크립트가 준비되지 않았습니다. 잠시 후 다시 시도해주세요.");
+    if (!userId) {
+      setStatusText("사용자 식별 정보가 없어 Google OAuth를 시작할 수 없습니다.");
       return;
     }
-
     setGoogleConnecting(true);
     setStatusText(null);
 
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tokenClient = googleWindow.google?.accounts?.oauth2?.initTokenClient({
-          client_id: GOOGLE_CLIENT_ID,
-          scope: GOOGLE_SCOPES,
-          ux_mode: "popup",
-          callback: (response) => {
-            if (response.error || !response.access_token) {
-              reject(new Error(response.error ?? "Google OAuth 토큰 발급 실패"));
-              return;
-            }
-            void (async () => {
-              await onSaveApiKey("google_oauth_access_token", response.access_token as string);
-              rememberSavedKey("google_oauth_access_token");
-              const meta = JSON.stringify({
-                issued_at: new Date().toISOString(),
-                expires_in: response.expires_in ?? null,
-                scope: response.scope ?? GOOGLE_SCOPES
-              });
-              await onSaveApiKey("google_oauth_token_meta", meta);
-              rememberSavedKey("google_oauth_token_meta");
-              resolve();
-            })().catch(reject);
-          },
-          error_callback: (error) =>
-            reject(new Error(error.message || error.type || "Google OAuth 초기화 실패"))
-        });
-
-        tokenClient?.requestAccessToken({ prompt: hasGoogleToken ? "" : "consent" });
-      });
-
-      await onRefreshConnectionStatus();
-      setStatusText("Google Workspace OAuth 토큰이 저장되었습니다.");
-    } catch (error) {
-      const message = (error as Error).message;
-      if (message.includes("redirect_uri_mismatch") || message.includes("origin_mismatch")) {
-        const origin = window.location.origin;
-        const callback = `${origin}/oauth/google/callback`;
-        const localhostHint =
-          window.location.hostname === "localhost"
-            ? " (로컬 테스트 시 `http://127.0.0.1:3000` 도 함께 등록 권장)"
-            : "";
+    if (!connectionStatus?.google_workspace.oauth_configured) {
+      const googleWindow = window as GoogleWindow;
+      if (!googleWindow.google?.accounts?.oauth2) {
+        setGoogleConnecting(false);
         setStatusText(
-          `Google OAuth 400: redirect_uri_mismatch/origin_mismatch. Google Cloud Console의 OAuth 클라이언트(${GOOGLE_CLIENT_ID})에 Authorized JavaScript origins=${origin}, Authorized redirect URIs=${callback} 를 등록 후 다시 시도해주세요.${localhostHint}`
+          "백엔드 OAuth 미설정 + Google OAuth 스크립트 미준비 상태입니다. 잠시 후 다시 시도하거나 백엔드 OAuth를 설정해주세요."
         );
-      } else {
-        setStatusText(message);
+        return;
       }
-    } finally {
-      setGoogleConnecting(false);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tokenClient = googleWindow.google?.accounts?.oauth2?.initTokenClient({
+            client_id: GOOGLE_CLIENT_ID,
+            scope: GOOGLE_SCOPES,
+            ux_mode: "popup",
+            callback: (response) => {
+              if (response.error || !response.access_token) {
+                reject(new Error(response.error ?? "Google OAuth 토큰 발급 실패"));
+                return;
+              }
+              void (async () => {
+                await onSaveApiKey("google_oauth_access_token", response.access_token as string);
+                rememberSavedKey("google_oauth_access_token");
+                const meta = JSON.stringify({
+                  issued_at: new Date().toISOString(),
+                  expires_in: response.expires_in ?? null,
+                  scope: response.scope ?? GOOGLE_SCOPES,
+                  source: "frontend_token_fallback"
+                });
+                await onSaveApiKey("google_oauth_token_meta", meta);
+                rememberSavedKey("google_oauth_token_meta");
+                resolve();
+              })().catch(reject);
+            },
+            error_callback: (error) =>
+              reject(new Error(error.message || error.type || "Google OAuth 초기화 실패"))
+          });
+          tokenClient?.requestAccessToken({ prompt: hasGoogleToken ? "" : "consent" });
+        });
+        setStatusText(
+          "Google OAuth 연결 완료(프론트 토큰 모드). 장기 안정화를 위해 백엔드 OAuth 설정도 권장됩니다."
+        );
+        await onRefreshConnectionStatus();
+      } catch (error) {
+        setStatusText((error as Error).message);
+      } finally {
+        setGoogleConnecting(false);
+      }
+      return;
     }
-  }, [hasGoogleToken, onRefreshConnectionStatus, onSaveApiKey, rememberSavedKey]);
+
+    const returnTo = window.location.href;
+    const startUrl = `${BACKEND_URL}/api/google/oauth/start?user_id=${encodeURIComponent(
+      userId
+    )}&return_to=${encodeURIComponent(returnTo)}`;
+    const popup = window.open(
+      startUrl,
+      "agentgcs_google_oauth",
+      "width=560,height=760,menubar=no,toolbar=no,status=no"
+    );
+    if (!popup) {
+      setGoogleConnecting(false);
+      setStatusText("브라우저 팝업이 차단되어 OAuth를 시작할 수 없습니다.");
+      return;
+    }
+    const poll = window.setInterval(() => {
+      if (popup.closed) {
+        window.clearInterval(poll);
+        setGoogleConnecting(false);
+        void onRefreshConnectionStatus();
+      }
+    }, 600);
+    window.setTimeout(() => window.clearInterval(poll), 120000);
+  }, [
+    connectionStatus?.google_workspace.oauth_configured,
+    hasGoogleToken,
+    onRefreshConnectionStatus,
+    onSaveApiKey,
+    rememberSavedKey,
+    userId
+  ]);
 
   const connectDatabaseSession = useCallback(async () => {
     if (!hasSupabaseEnv || !supabase) {
@@ -480,6 +601,56 @@ export const SettingsModal = memo(function SettingsModal({
       setSavingKey(false);
     }
   }, [onRefreshConnectionStatus, onSaveApiKey, rememberSavedKey, schoolApiToken]);
+
+  const saveOpenAiToken = useCallback(async () => {
+    const normalized = extractBearerToken(openAiApiToken);
+    if (!normalized) return;
+    setSavingKey(true);
+    setStatusText(null);
+    try {
+      await onSaveApiKey("openai_api_key", normalized);
+      rememberSavedKey("openai_api_key");
+      setOpenAiApiToken("");
+      setStatusText("OpenAI 예비용 API 키가 저장되었습니다. (Claude 429 시 자동 폴백)");
+      await onRefreshConnectionStatus();
+    } catch (error) {
+      setStatusText((error as Error).message);
+    } finally {
+      setSavingKey(false);
+    }
+  }, [onRefreshConnectionStatus, onSaveApiKey, openAiApiToken, rememberSavedKey]);
+
+  const saveGoogleOAuthClient = useCallback(async () => {
+    const normalizedClientId = googleClientIdInput.trim();
+    const normalizedSecret = googleClientSecretInput.trim();
+    if (!normalizedClientId && !normalizedSecret) return;
+    setSavingKey(true);
+    setStatusText(null);
+    try {
+      if (normalizedClientId) {
+        await onSaveApiKey("google_client_id", normalizedClientId);
+        rememberSavedKey("google_client_id");
+      }
+      if (normalizedSecret) {
+        await onSaveApiKey("google_client_secret", normalizedSecret);
+        rememberSavedKey("google_client_secret");
+      }
+      setGoogleClientIdInput("");
+      setGoogleClientSecretInput("");
+      setStatusText("Google OAuth 클라이언트 정보가 저장되었습니다.");
+      await onRefreshConnectionStatus();
+    } catch (error) {
+      setStatusText((error as Error).message);
+    } finally {
+      setSavingKey(false);
+    }
+  }, [
+    googleClientIdInput,
+    googleClientSecretInput,
+    onRefreshConnectionStatus,
+    onSaveApiKey,
+    rememberSavedKey
+  ]);
 
   const handleSaveSettings = useCallback(async () => {
     setSaving(true);
@@ -536,6 +707,33 @@ export const SettingsModal = memo(function SettingsModal({
                 <CardDescription>
                   `api.1000.school` 토큰은 Claude 연결 토큰으로도 함께 사용됩니다.
                 </CardDescription>
+                <div className="rounded-xl border border-white/70 bg-white/45 p-2 dark:border-slate-700 dark:bg-slate-800/60">
+                  <p className="mb-1 text-xs font-semibold text-gray-800 dark:text-slate-100">
+                    AI 제공자 선택
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={selectedProvider === "claude" ? "accent" : "secondary"}
+                      onClick={() =>
+                        setDraftSettings((current) => ({ ...current, ai_provider: "claude" }))
+                      }
+                    >
+                      Claude
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={selectedProvider === "openai" ? "accent" : "secondary"}
+                      onClick={() =>
+                        setDraftSettings((current) => ({ ...current, ai_provider: "openai" }))
+                      }
+                    >
+                      ChatGPT
+                    </Button>
+                  </div>
+                </div>
                 <Input
                   value={schoolApiToken}
                   onChange={(event) => setSchoolApiToken(event.target.value)}
@@ -559,6 +757,39 @@ export const SettingsModal = memo(function SettingsModal({
                   >
                     연결 상태 갱신
                   </Button>
+                </div>
+
+                <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
+                  <p className="mb-2 font-semibold text-gray-800 dark:text-slate-100">
+                    Google OAuth 정식 모드 설정
+                  </p>
+                  <Input
+                    value={googleClientIdInput}
+                    onChange={(event) => setGoogleClientIdInput(event.target.value)}
+                    placeholder="Google OAuth Client ID (미입력 시 기본값 사용)"
+                  />
+                  <Input
+                    value={googleClientSecretInput}
+                    onChange={(event) => setGoogleClientSecretInput(event.target.value)}
+                    placeholder="Google OAuth Client Secret"
+                    className="mt-2"
+                    type="password"
+                  />
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      disabled={savingKey || (!googleClientIdInput.trim() && !googleClientSecretInput.trim())}
+                      onClick={() => void saveGoogleOAuthClient()}
+                    >
+                      OAuth 클라이언트 저장
+                    </Button>
+                    {statusChip(
+                      Boolean(connectionStatus?.google_workspace.oauth_configured),
+                      "정식 모드 준비됨",
+                      "정식 모드 미설정"
+                    )}
+                  </div>
                 </div>
 
                 <div className="rounded-xl border border-white/70 bg-white/50 p-3 dark:border-slate-700 dark:bg-slate-800/60">
@@ -600,15 +831,24 @@ export const SettingsModal = memo(function SettingsModal({
                   <div className="mb-2 flex items-center justify-between">
                     <p className="text-sm font-semibold text-gray-800 dark:text-slate-100">Google Workspace</p>
                     {statusChip(
-                      Boolean(connectionStatus?.google_workspace.token_saved),
+                      Boolean(connectionStatus?.google_workspace.reachable),
                       "정상 작동중",
-                      "미연결"
+                      connectionStatus?.google_workspace.token_saved ? "부분 오류" : "미연결"
                     )}
                   </div>
+                  <p className="mb-2 text-xs text-orange-900/75 dark:text-slate-300/80">
+                    OAuth client: {connectionStatus?.google_workspace.oauth_configured ? "configured" : "missing"} /{" "}
+                    상태: {connectionStatus?.google_workspace.status ?? "unknown"}
+                    {connectionStatus?.google_workspace.token_expired ? " / access token 만료" : ""}
+                    {connectionStatus?.google_workspace.refresh_available ? " / refresh token 보유" : ""}
+                    {connectionStatus?.google_workspace.reason
+                      ? ` / reason: ${connectionStatus.google_workspace.reason}`
+                      : ""}
+                  </p>
                   <Button
                     type="button"
                     variant="secondary"
-                    disabled={!googleReady || googleConnecting}
+                    disabled={googleConnecting || (!googleReady && !connectionStatus?.google_workspace.oauth_configured)}
                     onClick={() => void connectGoogleWorkspace()}
                     className="w-full"
                   >
@@ -644,6 +884,32 @@ export const SettingsModal = memo(function SettingsModal({
                       ? ` / reason: ${connectionStatus.database.reason}`
                       : ""}
                   </p>
+                </div>
+
+                <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
+                  <p className="mb-2 font-semibold text-gray-800 dark:text-slate-100">
+                    OpenAI 예비용 API (Claude 429 대비)
+                  </p>
+                  <Input
+                    value={openAiApiToken}
+                    onChange={(event) => setOpenAiApiToken(event.target.value)}
+                    placeholder="OpenAI API Key 입력 (sk-...)"
+                  />
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      disabled={savingKey || !openAiApiToken.trim()}
+                      onClick={() => void saveOpenAiToken()}
+                    >
+                      예비 키 저장
+                    </Button>
+                    {statusChip(
+                      hasOpenAiFallbackKey,
+                      "폴백 준비됨",
+                      "미설정"
+                    )}
+                  </div>
                 </div>
 
                 <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
@@ -821,7 +1087,7 @@ export const SettingsModal = memo(function SettingsModal({
                   )}
                 </button>
                 {advancedOpen && (
-                  <div className="space-y-2">
+                  <div className="space-y-3">
                     <Input
                       value={draftSettings.claude_base_url ?? ""}
                       onChange={(event) =>
@@ -832,8 +1098,10 @@ export const SettingsModal = memo(function SettingsModal({
                       }
                       placeholder="Claude Base URL"
                     />
-                    <label className="block space-y-1 text-xs text-orange-900/75 dark:text-slate-300/80">
-                      <span className="font-semibold">모델 선택 (claude.1000.school 제공 모델)</span>
+                    <div className="rounded-xl border border-white/70 bg-white/45 p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                      <p className="mb-2 text-xs font-semibold text-orange-900/80 dark:text-slate-200">
+                        Claude 메인 모델
+                      </p>
                       <select
                         value={draftSettings.preferred_model ?? ""}
                         onChange={(event) =>
@@ -851,19 +1119,54 @@ export const SettingsModal = memo(function SettingsModal({
                           </option>
                         ))}
                       </select>
-                    </label>
-                    <Input
-                      value={draftSettings.preferred_model ?? ""}
-                      onChange={(event) =>
-                        setDraftSettings((current) => ({
-                          ...current,
-                          preferred_model: event.target.value
-                        }))
-                      }
-                      placeholder="모델명을 직접 입력할 수도 있습니다."
-                    />
+                      <Input
+                        value={draftSettings.preferred_model ?? ""}
+                        onChange={(event) =>
+                          setDraftSettings((current) => ({
+                            ...current,
+                            preferred_model: event.target.value
+                          }))
+                        }
+                        placeholder="Claude 모델명을 직접 입력"
+                        className="mt-2"
+                      />
+                    </div>
+
+                    <div className="rounded-xl border border-white/70 bg-white/45 p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                      <p className="mb-2 text-xs font-semibold text-orange-900/80 dark:text-slate-200">
+                        ChatGPT 메인 모델
+                      </p>
+                      <select
+                        value={draftSettings.openai_preferred_model ?? ""}
+                        onChange={(event) =>
+                          setDraftSettings((current) => ({
+                            ...current,
+                            openai_preferred_model: event.target.value || null
+                          }))
+                        }
+                        className="h-10 w-full rounded-xl border border-white/80 bg-white/70 px-3 text-sm text-gray-800 outline-none focus:border-orange-300 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-100"
+                      >
+                        <option value="">자동 선택</option>
+                        {["gpt-5-mini", "gpt-5.2", "gpt-5", "gpt-4o", "gpt-4.1"].map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                      <Input
+                        value={draftSettings.openai_preferred_model ?? ""}
+                        onChange={(event) =>
+                          setDraftSettings((current) => ({
+                            ...current,
+                            openai_preferred_model: event.target.value
+                          }))
+                        }
+                        placeholder="GPT 모델명을 직접 입력"
+                        className="mt-2"
+                      />
+                    </div>
                     <p className="text-xs text-orange-900/70 dark:text-slate-300/80">
-                      권장: GPT-5 계열 모델(`gpt-5.2`, `gpt-5`) 우선 사용
+                      메인 AI 제공자는 상단 스위치에서 고르고, 여기서 Claude/GPT 각각의 기본 모델을 지정합니다.
                     </p>
                   </div>
                 )}

@@ -61,7 +61,7 @@ const DEFAULT_STATS: PersonaStats = {
   logic: 76,
   critical_thinking: 79,
   data_dependency: 71,
-  empathy: 48,
+  cautiousness: 48,
   drive: 84
 };
 
@@ -69,8 +69,10 @@ const DEFAULT_SETTINGS: UserSettings = {
   theme: "system",
   dev_mode: false,
   debug_raw_mode: false,
+  ai_provider: "claude",
   claude_base_url: "https://claude.1000.school",
-  preferred_model: "gpt-5.2",
+  preferred_model: "claude-sonnet-4-6",
+  openai_preferred_model: "gpt-5-mini",
   knowledge_base_prompt: null,
   chat_mode_personas: {
     cautious: {
@@ -78,7 +80,7 @@ const DEFAULT_SETTINGS: UserSettings = {
       logic: 92,
       critical_thinking: 95,
       data_dependency: 88,
-      empathy: 52,
+      cautiousness: 88,
       drive: 58
     },
     balanced: {
@@ -86,7 +88,7 @@ const DEFAULT_SETTINGS: UserSettings = {
       logic: 78,
       critical_thinking: 79,
       data_dependency: 72,
-      empathy: 64,
+      cautiousness: 66,
       drive: 72
     },
     creative: {
@@ -94,7 +96,7 @@ const DEFAULT_SETTINGS: UserSettings = {
       logic: 62,
       critical_thinking: 58,
       data_dependency: 46,
-      empathy: 68,
+      cautiousness: 34,
       drive: 86
     },
     autonomous: {
@@ -102,7 +104,7 @@ const DEFAULT_SETTINGS: UserSettings = {
       logic: 82,
       critical_thinking: 78,
       data_dependency: 66,
-      empathy: 54,
+      cautiousness: 52,
       drive: 93
     }
   },
@@ -186,6 +188,36 @@ function summarizeEvent(event: AgentEvent): string | null {
   if (event.event_type === "chat.processing") {
     return null;
   }
+  if (event.event_type === "chat.intent.classified") {
+    return `의도 분류: ${String(payload.intent ?? "unknown")} (${String(payload.confidence ?? "-")})`;
+  }
+  if (event.event_type === "chat.stream.started") {
+    return "응답 스트리밍을 시작합니다.";
+  }
+  if (event.event_type === "chat.stream.delta") {
+    return null;
+  }
+  if (event.event_type === "chat.stream.completed") {
+    return "응답 스트리밍이 완료되었습니다.";
+  }
+  if (event.event_type === "pipeline.planner.started") {
+    return "계획 수립을 시작합니다.";
+  }
+  if (event.event_type === "pipeline.planner.completed") {
+    return `실행 계획 확정 (${String(payload.step_count ?? "?")} steps)`;
+  }
+  if (event.event_type === "pipeline.executor.replan_requested") {
+    return `오류 복구 재계획: ${String(payload.reason ?? "원인 미상")}`;
+  }
+  if (event.event_type === "pipeline.executor.step_failed") {
+    return `실행 단계 실패 (${String(payload.tool ?? "tool")}): ${String(payload.error ?? "unknown")}`;
+  }
+  if (event.event_type === "pipeline.synthesizer.started") {
+    return "최종 응답을 정리 중입니다.";
+  }
+  if (event.event_type === "pipeline.failed") {
+    return `파이프라인 실패: ${String(payload.code ?? "unknown")} / ${String(payload.message ?? "")}`;
+  }
   return null;
 }
 
@@ -246,6 +278,7 @@ export default function HomePage() {
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const apiKeysRef = useRef<ApiKeyMeta[]>([]);
   const devModeRef = useRef<boolean>(settings.dev_mode);
+  const providerRef = useRef<"claude" | "openai">(settings.ai_provider);
 
   const activeTaskPersona = useMemo(() => {
     const target = settings.personas.find((persona) => persona.id === settings.active_persona_id);
@@ -268,14 +301,41 @@ export default function HomePage() {
       apiKeys.some((item) => item.key_name === "school_api_token"),
     [apiKeys, connectionStatus?.school_api.token_saved, settings.dev_mode]
   );
+  const hasOpenAiToken = useMemo(
+    () =>
+      settings.dev_mode ||
+      Boolean(connectionStatus?.openai_fallback?.reachable) ||
+      Boolean(connectionStatus?.openai_fallback?.token_saved) ||
+      apiKeys.some((item) => item.key_name === "openai_api_key"),
+    [
+      apiKeys,
+      connectionStatus?.openai_fallback?.reachable,
+      connectionStatus?.openai_fallback?.token_saved,
+      settings.dev_mode
+    ]
+  );
+  const hasAiChatToken = useMemo(
+    () => (settings.ai_provider === "openai" ? hasOpenAiToken : hasSchoolApiToken),
+    [hasOpenAiToken, hasSchoolApiToken, settings.ai_provider]
+  );
   const connectionRows = useMemo(() => {
+    const provider = settings.ai_provider;
     const claudeLevel: HealthLevel = connectionStatus?.claude.reachable ? "ok" : "error";
+    const openAiLevel: HealthLevel = connectionStatus?.openai_fallback?.reachable
+      ? "ok"
+      : hasOpenAiToken
+        ? "warn"
+        : "error";
     const schoolLevel: HealthLevel = connectionStatus?.school_api.reachable
       ? "ok"
       : connectionStatus?.school_api.token_saved
         ? "warn"
         : "error";
-    const googleLevel: HealthLevel = connectionStatus?.google_workspace.token_saved ? "ok" : "warn";
+    const googleLevel: HealthLevel = connectionStatus?.google_workspace.reachable
+      ? "ok"
+      : connectionStatus?.google_workspace.token_saved
+        ? "warn"
+        : "error";
     const dbLevel: HealthLevel = connectionStatus?.database?.connected
       ? "ok"
       : settings.dev_mode
@@ -284,15 +344,27 @@ export default function HomePage() {
 
     return [
       {
-        key: "claude",
-        label: "Claude",
-        status: connectionStatus?.claude.reachable
-          ? "정상 작동중"
-          : `오류 (${connectionStatus?.claude.status ?? "unknown"})`,
-        detail: connectionStatus?.claude.reachable
-          ? null
-          : "Base URL, API 토큰, 게이트웨이 상태를 점검해주세요.",
-        level: claudeLevel
+        key: "ai",
+        label: provider === "openai" ? "ChatGPT (OpenAI)" : "Claude",
+        status:
+          provider === "openai"
+            ? connectionStatus?.openai_fallback?.reachable
+              ? `정상 작동중 (${connectionStatus?.openai_fallback?.model ?? "gpt"})`
+              : hasOpenAiToken
+                ? `부분 오류 (${connectionStatus?.openai_fallback?.status ?? "diagnostics_unavailable"})`
+                : "미연결"
+            : connectionStatus?.claude.reachable
+              ? "정상 작동중"
+              : `오류 (${connectionStatus?.claude.status ?? "unknown"})`,
+        detail:
+          provider === "openai"
+            ? connectionStatus?.openai_fallback?.reachable
+              ? null
+              : "OpenAI API 키 저장 및 권한/쿼터를 점검해주세요."
+            : connectionStatus?.claude.reachable
+              ? null
+              : "Base URL, API 토큰, 게이트웨이 상태를 점검해주세요.",
+        level: provider === "openai" ? openAiLevel : claudeLevel
       },
       {
         key: "school",
@@ -308,8 +380,16 @@ export default function HomePage() {
       {
         key: "google",
         label: "Google Workspace",
-        status: connectionStatus?.google_workspace.token_saved ? "연결됨" : "연결 필요",
-        detail: null,
+        status: connectionStatus?.google_workspace.reachable
+          ? "정상 작동중"
+          : connectionStatus?.google_workspace.token_saved
+            ? `부분 오류 (${connectionStatus?.google_workspace.status ?? "unknown"})`
+            : "연결 필요",
+        detail:
+          connectionStatus?.google_workspace.reason ??
+          (connectionStatus?.google_workspace.token_expired
+            ? "Google access token이 만료되었습니다. OAuth 재연결이 필요합니다."
+            : null),
         level: googleLevel
       },
       {
@@ -322,7 +402,7 @@ export default function HomePage() {
         level: dbLevel
       }
     ] as const;
-  }, [connectionStatus, settings.dev_mode]);
+  }, [connectionStatus, hasOpenAiToken, settings.ai_provider, settings.dev_mode]);
 
   const userId = session?.userId ?? "";
   const userEmail = session?.email ?? null;
@@ -334,6 +414,9 @@ export default function HomePage() {
   useEffect(() => {
     devModeRef.current = settings.dev_mode;
   }, [settings.dev_mode]);
+  useEffect(() => {
+    providerRef.current = settings.ai_provider;
+  }, [settings.ai_provider]);
 
   const renderedMessages = useMemo(
     () =>
@@ -407,16 +490,31 @@ export default function HomePage() {
     const localHasSchoolToken = apiKeysRef.current.some(
       (item) => item.key_name === "school_api_token"
     );
+    const localHasOpenAiToken = apiKeysRef.current.some(
+      (item) => item.key_name === "openai_api_key"
+    );
     const devModeEnabled = devModeRef.current;
+    const provider = providerRef.current;
     try {
       const response = await fetchConnectionStatus(userId);
       setConnectionStatus(response);
-      setForceKeySetup(
-        !response.school_api.token_saved && !localHasSchoolToken && !devModeEnabled
-      );
+      if (provider === "openai") {
+        const openAiReady = Boolean(
+          response.openai_fallback?.token_saved || response.openai_fallback?.reachable
+        );
+        setForceKeySetup(!openAiReady && !localHasOpenAiToken && !devModeEnabled);
+      } else {
+        setForceKeySetup(
+          !response.school_api.token_saved && !localHasSchoolToken && !devModeEnabled
+        );
+      }
     } catch {
       setConnectionStatus(null);
-      setForceKeySetup(!localHasSchoolToken && !devModeEnabled);
+      setForceKeySetup(
+        provider === "openai"
+          ? !localHasOpenAiToken && !devModeEnabled
+          : !localHasSchoolToken && !devModeEnabled
+      );
     }
   }, [userId]);
 
@@ -546,11 +644,16 @@ export default function HomePage() {
             ...(settingsResponse.settings?.chat_mode_personas ?? {})
           }
         };
-        if (
-          !nextSettings.preferred_model ||
-          nextSettings.preferred_model === "claude-3-5-sonnet-20241022"
-        ) {
-          nextSettings.preferred_model = "gpt-5.2";
+        if (!nextSettings.ai_provider) {
+          nextSettings.ai_provider = "claude";
+        }
+        if (!nextSettings.preferred_model) {
+          nextSettings.preferred_model = "claude-sonnet-4-6";
+        }
+        if (!nextSettings.openai_preferred_model) {
+          nextSettings.openai_preferred_model = "gpt-5-mini";
+        }
+        if (!settingsResponse.settings?.preferred_model || !settingsResponse.settings?.openai_preferred_model) {
           try {
             await saveWorkspaceSettings(sessionUserId, nextSettings);
           } catch {
@@ -640,46 +743,79 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!userId) return;
-    const base = resolveWsBase();
-    const ws = new WebSocket(`${base}?user_id=${encodeURIComponent(userId)}`);
-    wsRef.current = ws;
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+    let heartbeatTimer: number | null = null;
+    let retryCount = 0;
 
-    const heartbeat = window.setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send("ping");
+    const clearHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
       }
-    }, 15000);
-
-    ws.onopen = () => {
-      setSocketConnected(true);
     };
 
-    ws.onmessage = (message) => {
-      try {
-        const parsed = JSON.parse(message.data) as AgentEvent;
-        if (parsed.event_type) {
+    const connect = () => {
+      if (disposed) return;
+      const base = resolveWsBase();
+      const ws = new WebSocket(`${base}?user_id=${encodeURIComponent(userId)}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        retryCount = 0;
+        setSocketConnected(true);
+        clearHeartbeat();
+        heartbeatTimer = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send("ping");
+          }
+        }, 15000);
+      };
+
+      ws.onmessage = (message) => {
+        try {
+          const parsed = JSON.parse(message.data) as AgentEvent;
+          if (!parsed.event_type) return;
           appendEvent(parsed);
           const summary = summarizeEvent(parsed);
           if (summary && parsed.event_type !== "socket.connected") {
             appendAssistantMessage(summary);
           }
-          if (parsed.event_type === "deep_task.completed" || parsed.event_type === "deep_task.failed") {
+          if (
+            parsed.event_type === "deep_task.completed" ||
+            parsed.event_type === "deep_task.failed" ||
+            parsed.event_type === "pipeline.synthesizer.completed" ||
+            parsed.event_type === "pipeline.failed"
+          ) {
             setRunning(false);
           }
+        } catch {
+          // ignore non-json heartbeat payloads
         }
-      } catch {
-        // ignore heartbeat payload
-      }
+      };
+
+      ws.onclose = () => {
+        setSocketConnected(false);
+        clearHeartbeat();
+        if (disposed) return;
+        const backoff = Math.min(10000, 700 * 2 ** retryCount);
+        const jitter = Math.floor(Math.random() * 300);
+        retryCount += 1;
+        reconnectTimer = window.setTimeout(connect, backoff + jitter);
+      };
     };
 
-    ws.onclose = () => {
-      setSocketConnected(false);
-      window.clearInterval(heartbeat);
-    };
+    connect();
 
     return () => {
-      window.clearInterval(heartbeat);
-      ws.close();
+      disposed = true;
+      clearHeartbeat();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
       wsRef.current = null;
     };
   }, [appendAssistantMessage, appendEvent, userId]);
@@ -704,10 +840,15 @@ export default function HomePage() {
       setForceKeySetup(false);
       return;
     }
-    if (apiKeys.some((item) => item.key_name === "school_api_token")) {
+    if (
+      (settings.ai_provider === "openai" &&
+        apiKeys.some((item) => item.key_name === "openai_api_key")) ||
+      (settings.ai_provider === "claude" &&
+        apiKeys.some((item) => item.key_name === "school_api_token"))
+    ) {
       setForceKeySetup(false);
     }
-  }, [apiKeys, settings.dev_mode]);
+  }, [apiKeys, settings.ai_provider, settings.dev_mode]);
 
   const maybeRequireApproval = useCallback(
     async (mode: AutonomyMode, riskyAction: boolean): Promise<boolean> => {
@@ -759,8 +900,12 @@ export default function HomePage() {
   const handleChatSend = useCallback(
     async (text: string, mode: AutonomyMode) => {
       if (!userId || !settings) return;
-      if (!hasSchoolApiToken) {
-        appendAssistantMessage("API 키를 입력하세요. `api.1000.school` 토큰 저장 후 대화를 시작할 수 있습니다.");
+      if (!hasAiChatToken) {
+        appendAssistantMessage(
+          settings.ai_provider === "openai"
+            ? "API 키를 입력하세요. 설정에서 OpenAI 예비용 API 키를 저장하면 대화를 시작할 수 있습니다."
+            : "API 키를 입력하세요. `api.1000.school` 토큰 저장 후 대화를 시작할 수 있습니다."
+        );
         setSettingsOpen(true);
         return;
       }
@@ -790,9 +935,12 @@ export default function HomePage() {
           threadId: activeConversationId,
           title: text.slice(0, 30),
           mode,
+          aiProvider: settings.ai_provider,
+          claudeModel: settings.preferred_model ?? null,
+          openaiModel: settings.openai_preferred_model ?? null,
           personaStats: settings.chat_mode_personas[mode] ?? DEFAULT_STATS,
           knowledgePrompt: settings.knowledge_base_prompt ?? null,
-          useMock: settings.dev_mode || !connectionStatus?.claude.reachable,
+          useMock: settings.dev_mode,
           debugRaw: settings.debug_raw_mode
         });
 
@@ -823,8 +971,7 @@ export default function HomePage() {
     [
       activeConversationId,
       appendAssistantMessage,
-      connectionStatus?.claude.reachable,
-      hasSchoolApiToken,
+      hasAiChatToken,
       maybeRequireApproval,
       refreshConversations,
       settings,
@@ -850,8 +997,10 @@ export default function HomePage() {
     if (!userId) return;
     const normalized: UserSettings = {
       ...nextSettings,
+      ai_provider: nextSettings.ai_provider === "openai" ? "openai" : "claude",
       claude_base_url: nextSettings.claude_base_url?.trim() || null,
       preferred_model: nextSettings.preferred_model?.trim() || null,
+      openai_preferred_model: nextSettings.openai_preferred_model?.trim() || "gpt-5-mini",
       knowledge_base_prompt: nextSettings.knowledge_base_prompt?.trim() || null,
       chat_mode_personas: {
         ...DEFAULT_SETTINGS.chat_mode_personas,
@@ -915,23 +1064,15 @@ export default function HomePage() {
     try {
       const notifyCandidate = userEmail ?? undefined;
       const notifyEmail = isValidEmail(notifyCandidate) ? notifyCandidate : undefined;
-
-      const orchestratorPayload = {
-        task: trimmedTask,
-        persona_count: Math.max(3, settings.personas.length),
-        use_mock: settings.dev_mode || !connectionStatus?.claude.reachable
-      };
-
-      const orchestratorResp = await request<{ run_id: string }>(
-        "/api/orchestrator/run",
+      const response = await startDeepTask({
         userId,
-        {
-          method: "POST",
-          body: JSON.stringify(orchestratorPayload)
-        },
-        420000
-      );
-      setActiveRunId(orchestratorResp.run_id ?? null);
+        task: trimmedTask,
+        personaStats: activeTaskPersona?.stats ?? DEFAULT_STATS,
+        workerCount: Math.max(3, Math.min(6, settings.personas.length)),
+        notifyEmail,
+        useMock: settings.dev_mode
+      });
+      setActiveRunId(response.run_id ?? null);
     } catch (error) {
       setRunning(false);
       appendAssistantMessage(`과제 자동화 요청 실패: ${(error as Error).message}`);
@@ -1123,13 +1264,15 @@ export default function HomePage() {
                     <ChatInput
                       onSend={handleChatInputSend}
                       isCenter={messages.length === 0}
-                      disabled={chatLoading || loadingWorkspace || !hasSchoolApiToken}
+                      disabled={chatLoading || loadingWorkspace || !hasAiChatToken}
                     />
                   </>
                 )}
-                {!hasSchoolApiToken && (
+                {!hasAiChatToken && (
                   <p className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/85">
-                    API 키를 입력하세요. 설정에서 `api.1000.school` 토큰을 저장하면 AI 대화 입력창이 활성화됩니다.
+                    {settings.ai_provider === "openai"
+                      ? "API 키를 입력하세요. 설정에서 OpenAI API 키를 저장하면 AI 대화 입력창이 활성화됩니다."
+                      : "API 키를 입력하세요. 설정에서 `api.1000.school` 토큰을 저장하면 AI 대화 입력창이 활성화됩니다."}
                   </p>
                 )}
               </div>
@@ -1143,6 +1286,49 @@ export default function HomePage() {
                   <span className="font-mono text-[11px]">{session.userId}</span>
                 </CardDescription>
                 <div className="space-y-2">
+                  <div className="rounded-xl border border-white/70 bg-white/45 p-2 dark:border-slate-700 dark:bg-slate-800/60">
+                    <p className="mb-1 text-[11px] font-semibold text-orange-900/80 dark:text-slate-200">
+                      AI 제공자 전환
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        size="sm"
+                        variant={settings.ai_provider === "claude" ? "accent" : "secondary"}
+                        onClick={async () => {
+                          const next = { ...settings, ai_provider: "claude" as const };
+                          setSettings(next);
+                          if (userId) {
+                            try {
+                              await saveWorkspaceSettings(userId, next);
+                              await refreshConnectionStatus();
+                            } catch {
+                              // ignore
+                            }
+                          }
+                        }}
+                      >
+                        Claude
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={settings.ai_provider === "openai" ? "accent" : "secondary"}
+                        onClick={async () => {
+                          const next = { ...settings, ai_provider: "openai" as const };
+                          setSettings(next);
+                          if (userId) {
+                            try {
+                              await saveWorkspaceSettings(userId, next);
+                              await refreshConnectionStatus();
+                            } catch {
+                              // ignore
+                            }
+                          }
+                        }}
+                      >
+                        ChatGPT
+                      </Button>
+                    </div>
+                  </div>
                   {connectionRows.map((row) => {
                     const theme = resolveHealthLevelClass(row.level);
                     return (
@@ -1168,7 +1354,9 @@ export default function HomePage() {
                 </div>
                 {forceKeySetup && !settings.dev_mode && (
                   <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/80">
-                    `api.1000.school` 토큰을 먼저 저장해주세요.
+                    {settings.ai_provider === "openai"
+                      ? "OpenAI API 키를 먼저 저장해주세요."
+                      : "`api.1000.school` 토큰을 먼저 저장해주세요."}
                   </p>
                 )}
               </Card>

@@ -24,25 +24,31 @@ class Settings(BaseSettings):
 
     # Claude / Anthropic
     claude_api_key: str | None = None
-    anthropic_base_url: str | None = None
+    anthropic_base_url: str = "https://claude.1000.school"
     anthropic_auth_token: str | None = None
-    claude_model: str | None = None
+    claude_model: str = "claude-sonnet-4-6"
     school_api_token: str | None = None
+    openai_api_key: str | None = None
+    openai_fallback_url: str = "https://api.openai.com/v1/chat/completions"
+    openai_fallback_model: str = "gpt-5-mini"
 
     # NotebookLM / GCP
-    notebooklm_cli_path: str = "notebooklm-mcp-cli"
+    notebooklm_cli_path: str = "nlm"
     notebooklm_output_dir: str = "./outputs"
     gcp_project_id: str | None = None
     google_application_credentials: str | None = None
 
     # Google OAuth (Drive/Calendar/Gmail)
-    google_client_id: str | None = None
+    google_client_id: str | None = "513803184584-7sb5sp4qv68a534kvd0u3inp0ruf021r.apps.googleusercontent.com"
     google_client_secret: str | None = None
     google_oauth_redirect_uri: str | None = None
     google_oauth_access_token: str | None = None
 
-    # Other
-    claude_api_key: str | None = None
+    # Chat Context (Redis)
+    redis_url: str | None = None
+    chat_context_ttl_seconds: int = 60 * 60 * 24
+    chat_context_max_messages: int = 20
+    chat_context_key_prefix: str = "agentgcs:chatctx"
 
     @property
     def cors_origins(self) -> list[str]:

@@ -1,68 +1,64 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, TypedDict
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
-from app.core.supabase_client import get_supabase_admin
+from app.core.supabase_client import append_session_message, save_agent_log, save_session
 from app.models.schemas import DeepTaskRequest
 from app.services.claude_service import ClaudeService
 from app.services.integrations import send_gmail_notification, upload_to_google_drive
 from app.services.notebooklm import generate_notebooklm_assets
+from app.services.pptx_generator import generate_pptx_from_summary
 from app.services.websocket_manager import WebSocketManager
-from app.tools.web_search import search_trusted_sources
-
-try:
-    from langgraph.graph import END, START, StateGraph
-
-    LANGGRAPH_AVAILABLE = True
-except Exception:  # pragma: no cover - optional at runtime
-    LANGGRAPH_AVAILABLE = False
+from app.tools.web_search import search_academic_sources, search_general_sources
 
 
-class DebateState(TypedDict, total=False):
-    run_id: str
-    user_id: str
-    task: str
-    use_mock: bool
-    persona_stats: dict[str, int]
-    evidence: list[dict[str, Any]]
-    arguments: dict[str, str]
-    final_summary: str
-    claude_service: ClaudeService
-    stream_hook: Callable[[str, dict[str, Any]], Awaitable[None]]
+@dataclass(slots=True)
+class WorkerPersona:
+    worker_id: str
+    label: str
+    perspective: str
+    stat_weights: dict[str, float]
 
 
-PERSONAS: list[dict[str, Any]] = [
-    {
-        "id": "innovator",
-        "label": "Innovator",
-        "focus": "새로운 수익 모델과 파격적인 제품 경험",
-        "weights": {"creativity": 0.55, "drive": 0.25, "empathy": 0.2},
-    },
-    {
-        "id": "analyst",
-        "label": "Analyst",
-        "focus": "원가 구조, 유닛 이코노믹스, 실행 가능성",
-        "weights": {"logic": 0.5, "data_dependency": 0.35, "critical_thinking": 0.15},
-    },
-    {
-        "id": "skeptic",
-        "label": "Skeptic",
-        "focus": "핵심 리스크, 잘못된 가정, 실패 시나리오",
-        "weights": {"critical_thinking": 0.6, "logic": 0.25, "data_dependency": 0.15},
-    },
-    {
-        "id": "researcher",
-        "label": "Researcher",
-        "focus": "출처 기반 사실 검증과 근거 우선 제안",
-        "weights": {"data_dependency": 0.65, "logic": 0.2, "critical_thinking": 0.15},
-    },
-    {
-        "id": "operator",
-        "label": "Operator",
-        "focus": "로드맵, 마일스톤, 파트너십, 즉시 실행 계획",
-        "weights": {"drive": 0.45, "logic": 0.3, "empathy": 0.25},
-    },
+WORKER_TEMPLATES: list[WorkerPersona] = [
+    WorkerPersona(
+        worker_id="logic_critic",
+        label="Logic Critic",
+        perspective="핵심 가정/논리 오류/실행 리스크를 비판적으로 검증",
+        stat_weights={"logic": 0.5, "critical_thinking": 0.4, "cautiousness": 0.1},
+    ),
+    WorkerPersona(
+        worker_id="creative_builder",
+        label="Creative Builder",
+        perspective="새로운 제품/수익 모델/차별화된 시장 진입 전략 발굴",
+        stat_weights={"creativity": 0.6, "drive": 0.2, "data_dependency": 0.2},
+    ),
+    WorkerPersona(
+        worker_id="data_validator",
+        label="Data Validator",
+        perspective="출처 신뢰도, 수치 검증, 시장/학술 근거 재확인",
+        stat_weights={"data_dependency": 0.65, "logic": 0.2, "critical_thinking": 0.15},
+    ),
+    WorkerPersona(
+        worker_id="execution_operator",
+        label="Execution Operator",
+        perspective="로드맵, MVP 범위, 일정/리소스 계획, 우선순위 설정",
+        stat_weights={"drive": 0.45, "logic": 0.25, "cautiousness": 0.3},
+    ),
+    WorkerPersona(
+        worker_id="risk_controller",
+        label="Risk Controller",
+        perspective="법/보안/규제/운영 리스크와 실패 시나리오 관리",
+        stat_weights={"critical_thinking": 0.45, "cautiousness": 0.4, "logic": 0.15},
+    ),
+    WorkerPersona(
+        worker_id="market_strategist",
+        label="Market Strategist",
+        perspective="고객 세그먼트/채널/GTM/가격 전략 최적화",
+        stat_weights={"creativity": 0.25, "logic": 0.25, "drive": 0.25, "data_dependency": 0.25},
+    ),
 ]
 
 
@@ -70,25 +66,6 @@ class DeepTaskOrchestrator:
     def __init__(self, ws_manager: WebSocketManager, claude_service: ClaudeService) -> None:
         self.ws_manager = ws_manager
         self.claude_service = claude_service
-        self._graph = self._build_graph() if LANGGRAPH_AVAILABLE else None
-
-    def _build_graph(self):
-        graph = StateGraph(DebateState)
-        graph.add_node("discover", self._discover_node)
-
-        for persona in PERSONAS:
-            graph.add_node(persona["id"], self._make_persona_node(persona))
-
-        graph.add_node("synthesize", self._synthesize_node)
-
-        graph.add_edge(START, "discover")
-        previous = "discover"
-        for persona in PERSONAS:
-            graph.add_edge(previous, persona["id"])
-            previous = persona["id"]
-        graph.add_edge(previous, "synthesize")
-        graph.add_edge("synthesize", END)
-        return graph.compile()
 
     async def run_and_stream(
         self,
@@ -103,210 +80,289 @@ class DeepTaskOrchestrator:
         async def stream_hook(event_type: str, payload: dict[str, Any]) -> None:
             await self.ws_manager.emit(user_id, event_type, payload, run_id=run_id)
 
-        initial_state: DebateState = {
-            "run_id": run_id,
-            "user_id": user_id,
-            "task": request.task,
-            "use_mock": request.use_mock,
-            "persona_stats": request.persona_stats.as_dict(),
-            "arguments": {},
-            "claude_service": active_claude,
-            "stream_hook": stream_hook,
-        }
+        try:
+            result = await self._run_pipeline(
+                user_id=user_id,
+                run_id=run_id,
+                request=request,
+                claude=active_claude,
+                stream_hook=stream_hook,
+            )
+            await stream_hook(
+                "deep_task.completed",
+                {
+                    "final_summary": result["final_summary"],
+                    "arguments": result["arguments"],
+                    "sources": result["evidence"],
+                    "artifacts": result["artifacts"],
+                },
+            )
+        except Exception as exc:
+            await stream_hook(
+                "deep_task.failed",
+                {
+                    "message": "멀티 에이전트 파이프라인 실행 중 오류가 발생했습니다.",
+                    "error": str(exc),
+                },
+            )
+
+    async def run(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        request: DeepTaskRequest,
+        claude_override: ClaudeService | None = None,
+    ) -> dict[str, Any]:
+        async def noop(_event_type: str, _payload: dict[str, Any]) -> None:
+            return
+
+        return await self._run_pipeline(
+            user_id=user_id,
+            run_id=run_id,
+            request=request,
+            claude=claude_override or self.claude_service,
+            stream_hook=noop,
+        )
+
+    async def _run_pipeline(
+        self,
+        *,
+        user_id: str,
+        run_id: str,
+        request: DeepTaskRequest,
+        claude: ClaudeService,
+        stream_hook: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> dict[str, Any]:
+        try:
+            await save_session(
+                {
+                    "id": run_id,
+                    "user_id": user_id,
+                    "title": f"완전자율 실행: {request.task[:60]}",
+                    "task": request.task,
+                    "autonomy_mode": "autonomous",
+                }
+            )
+            await append_session_message(
+                session_id=run_id,
+                user_id=user_id,
+                role="system",
+                content=f"[system] 완전자율 실행 시작: {request.task}",
+                metadata={"run_id": run_id},
+            )
+        except Exception:
+            # local/dev fallback: continue without DB persistence
+            pass
 
         await stream_hook(
             "deep_task.started",
             {
-                "message": "정보 탐색 및 5인 페르소나 토론을 시작합니다.",
+                "message": "완전자율 멀티 에이전트(Worker + Moderator) 실행을 시작합니다.",
                 "task": request.task,
+                "worker_count": request.worker_count,
                 "persona_stats": request.persona_stats.model_dump(),
             },
         )
 
-        try:
-            if self._graph:
-                result = await self._graph.ainvoke(initial_state)
-            else:
-                result = await self._run_without_langgraph(initial_state)
+        general_task = asyncio.create_task(search_general_sources(request.task, max_results=6))
+        academic_task = asyncio.create_task(search_academic_sources(request.task, max_results=4))
+        general_sources, academic_sources = await asyncio.gather(general_task, academic_task)
+        evidence = [*general_sources, *academic_sources]
 
-            final_summary = result.get("final_summary", "")
-            notebooklm_result = await generate_notebooklm_assets(
-                run_id=run_id,
-                task=request.task,
-                final_summary=final_summary,
-            )
-            await stream_hook(
-                "deep_task.post_processing",
-                {
-                    "message": "NotebookLM 후처리가 완료되었습니다.",
-                    "notebooklm": notebooklm_result,
-                },
-            )
+        await stream_hook(
+            "deep_task.discovery",
+            {
+                "message": "일반 웹 검색 + 학술 검색 결과를 수집했습니다.",
+                "general_count": len(general_sources),
+                "academic_count": len(academic_sources),
+                "sources": evidence[:8],
+            },
+        )
 
-            drive_result = await upload_to_google_drive(
-                file_path=notebooklm_result.get("script_path", ""),
-                user_id=user_id,
-            )
-            await stream_hook(
-                "deep_task.drive_uploaded",
-                {
-                    "message": "결과물을 Google Drive로 업로드했습니다.",
-                    "drive": drive_result,
-                },
-            )
+        workers = self._select_workers(request.worker_count)
+        arguments: dict[str, str] = {}
+        rolling_context: list[str] = []
+        stat_snapshot = request.persona_stats.as_dict()
 
-            await self._persist_log(user_id=user_id, run_id=run_id, request=request, result=result)
-
-            await stream_hook(
-                "deep_task.completed",
-                {
-                    "final_summary": final_summary,
-                    "arguments": result.get("arguments", {}),
-                    "sources": result.get("evidence", []),
-                },
+        for worker in workers:
+            weight_score = self._weight_score(stat_snapshot, worker.stat_weights)
+            worker_stats = self._derive_worker_stats(stat_snapshot, worker.stat_weights)
+            evidence_lines = "\n".join(
+                f"- {doc.get('title')} ({doc.get('url')})" for doc in evidence[:8]
             )
-
-            if request.notify_email:
-                mail_result = await send_gmail_notification(
-                    user_id=user_id,
-                    to_email=request.notify_email,
-                    subject=f"[AgentGCS] 과제 분석 완료 - {request.task[:40]}",
-                    body=final_summary,
-                )
-                await stream_hook(
-                    "toast.notification",
-                    {
-                        "title": "결과 발송 예정",
-                        "description": f"{request.notify_email} 로 결과 요약 메일을 처리했습니다.",
-                        "action": {"label": "메일함 열기", "href": "https://mail.google.com"},
-                        "meta": mail_result,
-                    },
-                )
-        except Exception as exc:
-            await stream_hook(
-                "deep_task.failed",
-                {"message": "에이전트 파이프라인 실행 중 오류가 발생했습니다.", "error": str(exc)},
-            )
-
-    async def _run_without_langgraph(self, state: DebateState) -> DebateState:
-        running = dict(state)
-        running.update(await self._discover_node(running))
-        for persona in PERSONAS:
-            node = self._make_persona_node(persona)
-            running.update(await node(running))
-        running.update(await self._synthesize_node(running))
-        return running
-
-    async def _discover_node(self, state: DebateState) -> dict[str, Any]:
-        evidence = await search_trusted_sources(state["task"], max_results=5)
-        hook = state.get("stream_hook")
-        if hook:
-            await hook(
-                "deep_task.discovery",
-                {
-                    "message": "신뢰 가능한 출처 기반 정보 탐색이 완료되었습니다.",
-                    "sources": evidence,
-                },
-            )
-        return {"evidence": evidence}
-
-    def _make_persona_node(self, persona: dict[str, Any]):
-        async def persona_node(state: DebateState) -> dict[str, Any]:
-            stats = state["persona_stats"]
-            weight = self._weight_score(stats, persona["weights"])
-            source_lines = "\n".join(
-                f"- {doc['title']} ({doc['url']})" for doc in state.get("evidence", [])
-            )
+            debate_context = "\n".join(rolling_context[-3:])
             system_prompt = (
-                f"당신은 멀티 에이전트 토론의 {persona['label']} 역할입니다. "
-                f"핵심 관점: {persona['focus']}. "
-                f"현재 성향 가중치 점수는 {weight:.2f}/1.00 입니다."
+                f"당신은 멀티 에이전트 워커 {worker.label} 입니다.\n"
+                f"관점: {worker.perspective}\n"
+                f"성향 가중 점수: {weight_score:.3f}\n"
+                f"워커 성향 지표(0-100): {worker_stats}\n"
+                "목표: 다른 워커와 중복을 줄이고, 반박 가능한 근거 중심으로 주장하라."
             )
             user_prompt = (
-                f"과제: {state['task']}\n"
-                f"자료:\n{source_lines}\n\n"
-                "요구사항:\n"
-                "1) 비즈니스 모델 핵심 제안 2개\n"
-                "2) 90일 MVP 실행안 1개\n"
-                "3) 리스크 1개와 완화책 1개\n"
-                "답변은 한국어로 220자 이내 핵심 bullet 스타일."
+                f"과제:\n{request.task}\n\n"
+                f"검색 근거:\n{evidence_lines}\n\n"
+                f"이전 워커 발언:\n{debate_context or '(없음)'}\n\n"
+                "출력 형식:\n"
+                "1) 핵심 주장 2개\n"
+                "2) 근거 출처 1~2개\n"
+                "3) 반대 의견/리스크 1개\n"
+                "총 8줄 이내."
             )
-            active_claude = state.get("claude_service", self.claude_service)
-            argument = await active_claude.generate(
+            message = await claude.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                use_mock=state.get("use_mock", True),
-                cache_hint=f"persona-{persona['id']}",
+                use_mock=request.use_mock,
+                cache_hint=f"worker-{worker.worker_id}",
             )
-            merged_args = dict(state.get("arguments", {}))
-            merged_args[persona["id"]] = argument
+            arguments[worker.worker_id] = message
+            rolling_context.append(f"[{worker.label}] {message}")
 
-            hook = state.get("stream_hook")
-            if hook:
-                await hook(
-                    "deep_task.debate_turn",
-                    {
-                        "persona_id": persona["id"],
-                        "persona_label": persona["label"],
-                        "focus": persona["focus"],
-                        "weight_score": round(weight, 3),
-                        "message": argument,
-                    },
+            try:
+                await append_session_message(
+                    session_id=run_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=f"[{worker.label}] {message}",
+                    metadata={"type": "worker_argument", "worker_id": worker.worker_id},
                 )
-            return {"arguments": merged_args}
-
-        return persona_node
-
-    async def _synthesize_node(self, state: DebateState) -> dict[str, Any]:
-        discussion_text = "\n".join(
-            f"[{persona}] {text}" for persona, text in state.get("arguments", {}).items()
-        )
-        active_claude = state.get("claude_service", self.claude_service)
-        synthesis = await active_claude.generate(
-            system_prompt=(
-                "당신은 토론 정리자입니다. 상충되는 주장도 살리면서 실행 로드맵 중심으로 결론을 만드세요."
-            ),
-            user_prompt=(
-                f"과제: {state['task']}\n\n토론 내용:\n{discussion_text}\n\n"
-                "출력 포맷:\n"
-                "1) 핵심 비즈니스 모델 3줄\n"
-                "2) 0~90일 실행계획 4줄\n"
-                "3) 예상 KPI 3개\n"
-                "4) 즉시 해야 할 액션 2개"
-            ),
-            use_mock=state.get("use_mock", True),
-            cache_hint="synthesis",
-        )
-        hook = state.get("stream_hook")
-        if hook:
-            await hook(
-                "deep_task.synthesized",
-                {"message": "5인 토론 결과를 종합했습니다.", "summary": synthesis},
+            except Exception:
+                pass
+            await stream_hook(
+                "deep_task.debate_turn",
+                {
+                    "persona_id": worker.worker_id,
+                    "persona_label": worker.label,
+                    "focus": worker.perspective,
+                    "weight_score": round(weight_score, 4),
+                    "worker_stats": worker_stats,
+                    "message": message,
+                },
             )
-        return {"final_summary": synthesis}
 
-    def _weight_score(self, stats: dict[str, int], weight_map: dict[str, float]) -> float:
-        score = 0.0
-        for axis, ratio in weight_map.items():
-            score += (stats.get(axis, 50) / 100.0) * ratio
-        return min(1.0, max(0.0, score))
+        discussion_text = "\n\n".join(f"[{k}] {v}" for k, v in arguments.items())
+        moderator_prompt = (
+            "당신은 Moderator(중재자)다. 워커들의 충돌되는 의견을 조율해 최종 결론을 확정한다.\n"
+            "반드시 다음 순서로 답변하라:\n"
+            "1) 충돌된 주장 요약\n"
+            "2) 충돌 조정 근거(출처/논리)\n"
+            "3) 최종 결론\n"
+            "4) 즉시 실행 TODO 5개"
+        )
+        moderator_user = (
+            f"과제:\n{request.task}\n\n"
+            f"워커 토론:\n{discussion_text}\n\n"
+            "검색 증거 요약:\n"
+            + "\n".join(f"- {doc.get('title')} ({doc.get('url')})" for doc in evidence[:10])
+        )
+        final_summary = await claude.generate(
+            system_prompt=moderator_prompt,
+            user_prompt=moderator_user,
+            use_mock=request.use_mock,
+            cache_hint="moderator-final",
+        )
 
-    async def _persist_log(
-        self, *, user_id: str, run_id: str, request: DeepTaskRequest, result: dict[str, Any]
-    ) -> None:
-        payload = {
+        try:
+            await append_session_message(
+                session_id=run_id,
+                user_id=user_id,
+                role="assistant",
+                content=f"[Moderator] {final_summary}",
+                metadata={"type": "moderator_summary"},
+            )
+        except Exception:
+            pass
+        await stream_hook(
+            "deep_task.moderator_decision",
+            {"message": "중재자가 최종 결론을 확정했습니다.", "summary": final_summary},
+        )
+
+        notebooklm = await generate_notebooklm_assets(
+            run_id=run_id,
+            task=request.task,
+            final_summary=final_summary,
+        )
+        pptx_path = generate_pptx_from_summary(
+            run_id=run_id,
+            title=request.task[:80],
+            sections=[final_summary],
+            out_dir="./outputs",
+        )
+        drive_result = await upload_to_google_drive(file_path=pptx_path, user_id=user_id)
+
+        await stream_hook(
+            "deep_task.post_processing",
+            {
+                "message": "NotebookLM 요약/PPT 생성/Drive 업로드가 완료되었습니다.",
+                "notebooklm": notebooklm,
+                "pptx_path": pptx_path,
+                "drive": drive_result,
+            },
+        )
+
+        try:
+            await save_agent_log(
+                {
+                    "run_id": run_id,
+                    "user_id": user_id,
+                    "task": request.task,
+                    "persona_stats": request.persona_stats.model_dump(),
+                    "arguments": arguments,
+                    "final_summary": final_summary,
+                    "sources": evidence,
+                    "feedback_score": None,
+                }
+            )
+        except Exception:
+            pass
+
+        if request.notify_email:
+            mail_result = await send_gmail_notification(
+                user_id=user_id,
+                to_email=request.notify_email,
+                subject=f"[AgentGCS] 완전자율 과제 완료 - {request.task[:48]}",
+                body=final_summary,
+            )
+            await stream_hook(
+                "toast.notification",
+                {
+                    "title": "결과 메일 전송",
+                    "description": f"{request.notify_email} 로 결과를 전송했습니다.",
+                    "meta": mail_result,
+                },
+            )
+
+        return {
             "run_id": run_id,
-            "user_id": user_id,
             "task": request.task,
-            "persona_stats": request.persona_stats.model_dump(),
-            "arguments": result.get("arguments", {}),
-            "final_summary": result.get("final_summary", ""),
-            "sources": result.get("evidence", []),
-            "feedback_score": None,
+            "evidence": evidence,
+            "arguments": arguments,
+            "final_summary": final_summary,
+            "artifacts": {
+                "notebooklm": notebooklm,
+                "pptx_path": pptx_path,
+                "drive": drive_result,
+            },
         }
 
-        def _insert() -> None:
-            client = get_supabase_admin()
-            client.table("agent_logs").insert(payload).execute()
+    def _select_workers(self, count: int) -> list[WorkerPersona]:
+        count = max(3, min(6, count))
+        return WORKER_TEMPLATES[:count]
 
-        await asyncio.to_thread(_insert)
+    def _weight_score(self, stats: dict[str, int], weights: dict[str, float]) -> float:
+        score = 0.0
+        for key, ratio in weights.items():
+            score += (float(stats.get(key, 50)) / 100.0) * ratio
+        return min(1.0, max(0.0, score))
+
+    def _derive_worker_stats(
+        self,
+        base_stats: dict[str, int],
+        weights: dict[str, float],
+    ) -> dict[str, int]:
+        adjusted: dict[str, int] = {}
+        for key, value in base_stats.items():
+            ratio = float(weights.get(key, 0.0))
+            delta = 14 if ratio >= 0.45 else (8 if ratio >= 0.25 else (3 if ratio > 0 else 0))
+            adjusted[key] = max(0, min(100, int(value) + delta))
+        return adjusted

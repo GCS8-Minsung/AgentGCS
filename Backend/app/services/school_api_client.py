@@ -167,6 +167,24 @@ class SchoolApiClient:
             json_body=json_body,
         )
 
+    async def request_openapi_path(
+        self,
+        *,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized = path.strip()
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        return await self._request(
+            method=method.upper(),
+            path=normalized,
+            params=params,
+            json_body=json_body,
+        )
+
     async def list_meeting_rooms(self) -> list[dict]:
         data = await self._request("GET", "/meeting-rooms")
         return data if isinstance(data, list) else []

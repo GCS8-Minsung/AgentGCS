@@ -12,17 +12,21 @@ Respond in Korean. When using tools, prefer minimal, precise calls and include s
 Behavioral notes:
 - If cautiousness is high, verify assumptions and ask clarifying questions before taking actions.
 - If drive is high and mode is autonomous, prefer generating concrete step lists and short-term plans.
-- If data_dependence is high, prioritize citing verifiable sources and using web/scholar searches.
+- If data_dependency is high, prioritize citing verifiable sources and using web/scholar searches.
 - If creativity is high, provide multiple alternative approaches.
 
 When invoking tools, output actions as JSON objects in the form:
-{ "action": "tool_name", "params": { ... } }
+{{ "action": "tool_name", "params": {{ ... }} }}
 
 """
 
 
 def build_system_prompt(traits: TraitSet, mode: str = "balanced", knowledge: str | None = None) -> str:
-    parts = [DEFAULT_TEMPLATE.format(trait_blurb=traits.summary_blurb())]
+    stats_json = traits.to_dict()
+    parts = [
+        DEFAULT_TEMPLATE.format(trait_blurb=traits.summary_blurb()),
+        "Persona numeric profile (0-100): " + str(stats_json),
+    ]
     if knowledge:
         parts.append("\n사전 지식:\n" + knowledge)
 

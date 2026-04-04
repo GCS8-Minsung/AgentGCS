@@ -11,7 +11,7 @@ import {
 
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { PERSONA_AXES, PersonaStats } from "@/lib/types";
+import { normalizePersonaStats, PERSONA_AXES, PersonaStats } from "@/lib/types";
 
 type Props = {
   value: PersonaStats;
@@ -43,14 +43,15 @@ function PersonaRadarComponent({
   const moveRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | null>(null);
   const [activeAxisIndex, setActiveAxisIndex] = useState<number | null>(null);
+  const normalizedValue = useMemo(() => normalizePersonaStats(value), [value]);
 
   useEffect(() => {
-    valueRef.current = value;
-  }, [value]);
+    valueRef.current = normalizedValue;
+  }, [normalizedValue]);
 
   const data = useMemo(
-    () => PERSONA_AXES.map((axis) => ({ axis: axis.label, value: value[axis.key] })),
-    [value]
+    () => PERSONA_AXES.map((axis) => ({ axis: axis.label, value: normalizedValue[axis.key] })),
+    [normalizedValue]
   );
 
   const axisVectors = useMemo(
@@ -65,13 +66,13 @@ function PersonaRadarComponent({
   const handlePoints = useMemo(
     () =>
       PERSONA_AXES.map((axis, index) => {
-        const ratio = value[axis.key] / 100;
+        const ratio = normalizedValue[axis.key] / 100;
         return {
           x: center + axisVectors[index].x * safeRadius * ratio,
           y: center + axisVectors[index].y * safeRadius * ratio
         };
       }),
-    [axisVectors, center, safeRadius, value]
+    [axisVectors, center, normalizedValue, safeRadius]
   );
 
   const updateAxisByPointer = useCallback(
@@ -203,14 +204,14 @@ function PersonaRadarComponent({
                 type="number"
                 min={0}
                 max={100}
-                value={value[axis.key]}
+                value={normalizedValue[axis.key]}
                 onChange={(event) => {
                   const numeric = Number(event.target.value);
                   const clamped = Number.isFinite(numeric)
                     ? Math.max(0, Math.min(100, numeric))
                     : 0;
-                  if (value[axis.key] === clamped) return;
-                  onChange({ ...value, [axis.key]: clamped });
+                  if (normalizedValue[axis.key] === clamped) return;
+                  onChange({ ...normalizedValue, [axis.key]: clamped });
                 }}
               />
             </label>

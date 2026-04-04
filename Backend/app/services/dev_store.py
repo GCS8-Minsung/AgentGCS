@@ -16,7 +16,7 @@ DEFAULT_PERSONA = {
         "logic": 76,
         "critical_thinking": 79,
         "data_dependency": 71,
-        "empathy": 48,
+        "cautiousness": 48,
         "drive": 84,
     },
 }
@@ -25,8 +25,10 @@ DEFAULT_SETTINGS = {
     "theme": "system",
     "dev_mode": False,
     "debug_raw_mode": False,
+    "ai_provider": "claude",
     "claude_base_url": "https://claude.1000.school",
-    "preferred_model": "gpt-5.2",
+    "preferred_model": "claude-sonnet-4-6",
+    "openai_preferred_model": "gpt-5-mini",
     "knowledge_base_prompt": DEFAULT_AGENTGCS_GUIDELINE,
     "chat_mode_personas": {
         "cautious": {
@@ -34,7 +36,7 @@ DEFAULT_SETTINGS = {
             "logic": 92,
             "critical_thinking": 95,
             "data_dependency": 88,
-            "empathy": 52,
+            "cautiousness": 88,
             "drive": 58,
         },
         "balanced": {
@@ -42,7 +44,7 @@ DEFAULT_SETTINGS = {
             "logic": 78,
             "critical_thinking": 79,
             "data_dependency": 72,
-            "empathy": 64,
+            "cautiousness": 66,
             "drive": 72,
         },
         "creative": {
@@ -50,7 +52,7 @@ DEFAULT_SETTINGS = {
             "logic": 62,
             "critical_thinking": 58,
             "data_dependency": 46,
-            "empathy": 68,
+            "cautiousness": 34,
             "drive": 86,
         },
         "autonomous": {
@@ -58,7 +60,7 @@ DEFAULT_SETTINGS = {
             "logic": 82,
             "critical_thinking": 78,
             "data_dependency": 66,
-            "empathy": 54,
+            "cautiousness": 52,
             "drive": 93,
         },
     },

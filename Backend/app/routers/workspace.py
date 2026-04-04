@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from app.core.auth import get_current_user_id
 from app.core.default_guideline import DEFAULT_AGENTGCS_GUIDELINE
 from app.core.supabase_client import get_supabase_admin
+from app.dependencies import context_manager
 from app.models.schemas import (
     ConversationMessageCreateRequest,
     ConversationThreadCreateRequest,
@@ -65,6 +66,10 @@ def _normalize_settings(raw: dict | None) -> dict:
         merged["claude_base_url"] = None
     if merged.get("preferred_model") == "":
         merged["preferred_model"] = None
+    if merged.get("openai_preferred_model") == "":
+        merged["openai_preferred_model"] = None
+    if merged.get("ai_provider") not in {"claude", "openai"}:
+        merged["ai_provider"] = "claude"
     if merged.get("knowledge_base_prompt") == "":
         merged["knowledge_base_prompt"] = None
     if not merged.get("knowledge_base_prompt"):
@@ -323,6 +328,7 @@ async def delete_conversation(
         pass
 
     local_deleted = await dev_store.delete_thread(user_id, thread_id)
+    await context_manager.clear(f"{user_id}:{thread_id}")
     if not deleted:
         deleted = local_deleted
     return {"deleted": deleted, "thread_id": thread_id, "source": source}

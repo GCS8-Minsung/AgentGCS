@@ -1,4 +1,6 @@
 import asyncio
+import json
+import re
 from typing import Any, Dict, Optional
 
 from app.services.claude_service import ClaudeService
@@ -25,13 +27,21 @@ class ReActEngine:
         self.persistence_callback = persistence_callback
         self.event_callback = event_callback
 
-    async def run(self, system_prompt: str, user_prompt: str, use_mock: bool = False, session_id: str | None = None, agent_id: str | None = None) -> Dict:
+    async def run(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        use_mock: bool = False,
+        session_id: str | None = None,
+        agent_id: str | None = None,
+        user_id: str | None = None,
+    ) -> Dict:
         history: list[Dict] = []
         observation: Optional[str] = None
         for i in range(self.max_iters):
             prompt = self._build_prompt(system_prompt, user_prompt, history, observation)
             text = await self.claude.generate(system_prompt=system_prompt, user_prompt=prompt, use_mock=use_mock)
-            # Expected structured response: either a JSON action or final_answer
+            # Expected structured response: either a ReAct step or final_answer
             parsed = self._parse_response(text)
             step_meta = {"step": i, "parsed": parsed}
 
@@ -53,14 +63,23 @@ class ReActEngine:
 
             if self.event_callback:
                 try:
-                    await self.event_callback({"type": "assistant_step", "session_id": session_id, "agent_id": agent_id, "step": i, "parsed": parsed})
+                    await self.event_callback(
+                        {
+                            "type": "react.assistant_step",
+                            "session_id": session_id,
+                            "agent_id": agent_id,
+                            "step": i,
+                            "parsed": parsed,
+                        }
+                    )
                 except Exception:
                     pass
 
             history.append({"assistant": text, "parsed": parsed})
-            if parsed.get("type") == "action":
+            if parsed.get("type") == "step":
                 action = parsed.get("action")
                 params = parsed.get("params") or {}
+                thought = str(parsed.get("thought") or "")
                 # persist action request
                 if self.persistence_callback:
                     try:
@@ -70,17 +89,34 @@ class ReActEngine:
                                 "agent_id": agent_id,
                                 "step_index": i,
                                 "role": "action",
-                                "content": action,
-                                "meta": {"params": params},
+                                "content": action or "no_action",
+                                "meta": {"params": params, "thought": thought},
                             }
                         )
                     except Exception:
                         pass
-                try:
-                    result = await self.tool_call(action, params, user_id=agent_id)
-                    observation = f"TOOL_RESULT:{result}"
-                except Exception as exc:
-                    observation = f"TOOL_ERROR:{str(exc)[:200]}"
+                if action:
+                    try:
+                        result = await self.tool_call(action, params, user_id=user_id)
+                        observation = f"TOOL_RESULT:{result}"
+                    except Exception as exc:
+                        observation = f"TOOL_ERROR:{str(exc)[:200]}"
+                else:
+                    observation = "TOOL_SKIPPED: 모델이 현재 단계에서 도구 호출을 생략했습니다."
+                if self.event_callback:
+                    try:
+                        await self.event_callback(
+                            {
+                                "type": "react.tool_observation",
+                                "session_id": session_id,
+                                "agent_id": agent_id,
+                                "step": i,
+                                "action": action,
+                                "observation": observation[:1400],
+                            }
+                        )
+                    except Exception:
+                        pass
                 # persist observation
                 if self.persistence_callback:
                     try:
@@ -113,7 +149,11 @@ class ReActEngine:
                         )
                     except Exception:
                         pass
-                return {"status": "completed", "final": final_answer, "history": history}
+                return {
+                    "status": "completed",
+                    "final": final_answer,
+                    "history": history,
+                }
         # max iters reached
         return {"status": "max_iters_exceeded", "final": history[-1] if history else None, "history": history}
 
@@ -125,21 +165,46 @@ class ReActEngine:
                 parts.append(h.get("assistant", ""))
         if observation:
             parts.append(f"\n\nObservation:\n{observation}")
-        parts.append("\n\nRespond with either: {\"type\": \"action\", \"action\": \"tool_name\", \"params\": {...}} or {\"type\": \"final_answer\", \"answer\": \"...\"}")
+        parts.append(
+            "\n\nYou must follow ReAct strictly: Thought -> Action -> Observation -> Final Answer."
+        )
+        parts.append(
+            "\n\nRespond with JSON only. "
+            "Use either {\"type\": \"step\", \"thought\": \"...\", \"action\": \"tool_name\", \"params\": {...}} "
+            "or {\"type\": \"final_answer\", \"answer\": \"...\"}."
+        )
         return "\n".join(parts)
 
     def _parse_response(self, text: str) -> Dict:
-        # Try to extract JSON; naive but workable for now
-        import re, json
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if not m:
-            return {"type": "final_answer", "answer": text}
-        try:
-            data = json.loads(m.group(0))
-            if data.get("type") == "action":
-                return {"type": "action", "action": data.get("action"), "params": data.get("params")}
+        stripped = (text or "").strip()
+        candidates: list[str] = []
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+        block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.S)
+        if block:
+            candidates.append(block.group(1))
+        loose = re.search(r"\{.*\}", stripped, flags=re.S)
+        if loose:
+            candidates.append(loose.group(0))
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") in {"step", "action"}:
+                params = data.get("params")
+                action = data.get("action")
+                return {
+                    "type": "step",
+                    "thought": data.get("thought") if isinstance(data.get("thought"), str) else "",
+                    "action": action if isinstance(action, str) else "",
+                    "params": params if isinstance(params, dict) else {},
+                }
             if data.get("type") == "final_answer":
-                return {"type": "final_answer", "answer": data.get("answer")}
-        except Exception:
-            return {"type": "final_answer", "answer": text}
-        return {"type": "final_answer", "answer": text}
+                answer = data.get("answer")
+                return {"type": "final_answer", "answer": answer if isinstance(answer, str) else stripped}
+
+        return {"type": "final_answer", "answer": stripped}

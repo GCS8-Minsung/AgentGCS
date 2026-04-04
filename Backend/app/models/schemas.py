@@ -2,7 +2,7 @@ from datetime import datetime, date
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 TaskStatus = Literal["todo", "in_progress", "review", "done"]
@@ -13,16 +13,40 @@ class PersonaStats(BaseModel):
     logic: int = Field(default=70, ge=0, le=100)
     critical_thinking: int = Field(default=75, ge=0, le=100)
     data_dependency: int = Field(default=80, ge=0, le=100)
-    empathy: int = Field(default=45, ge=0, le=100)
+    cautiousness: int = Field(default=55, ge=0, le=100)
     drive: int = Field(default=65, ge=0, le=100)
+    # Backward-compat input key from legacy UI/data.
+    empathy: int | None = Field(default=None, ge=0, le=100, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "critical" in normalized and "critical_thinking" not in normalized:
+            normalized["critical_thinking"] = normalized["critical"]
+        if "data_dependence" in normalized and "data_dependency" not in normalized:
+            normalized["data_dependency"] = normalized["data_dependence"]
+        if "empathy" in normalized and "cautiousness" not in normalized:
+            normalized["cautiousness"] = normalized["empathy"]
+        return normalized
 
     def as_dict(self) -> dict[str, int]:
-        return self.model_dump()
+        return {
+            "creativity": self.creativity,
+            "logic": self.logic,
+            "critical_thinking": self.critical_thinking,
+            "data_dependency": self.data_dependency,
+            "cautiousness": self.cautiousness,
+            "drive": self.drive,
+        }
 
 
 class DeepTaskRequest(BaseModel):
     task: str = Field(min_length=3, max_length=500)
     persona_stats: PersonaStats
+    worker_count: int = Field(default=5, ge=3, le=6)
     notify_email: EmailStr | None = None
     use_mock: bool = True
 
@@ -126,8 +150,10 @@ class UserSettingsPayload(BaseModel):
     theme: Literal["light", "dark", "system"] = "system"
     dev_mode: bool = False
     debug_raw_mode: bool = False
+    ai_provider: Literal["claude", "openai"] = "claude"
     claude_base_url: str | None = Field(default=None, max_length=500)
     preferred_model: str | None = Field(default=None, max_length=120)
+    openai_preferred_model: str | None = Field(default=None, max_length=120)
     knowledge_base_prompt: str | None = Field(default=None, max_length=12000)
     chat_mode_personas: dict[str, PersonaStats] = Field(default_factory=dict)
     active_persona_id: str | None = None
@@ -151,10 +177,53 @@ class AgentChatRequest(BaseModel):
     thread_id: str | None = Field(default=None, max_length=120)
     title: str | None = Field(default=None, max_length=120)
     mode: Literal["cautious", "balanced", "creative", "autonomous"] = "balanced"
+    ai_provider: Literal["claude", "openai"] | None = None
+    claude_model: str | None = Field(default=None, max_length=120)
+    openai_model: str | None = Field(default=None, max_length=120)
     persona_stats: PersonaStats | None = None
     knowledge_prompt: str | None = Field(default=None, max_length=12000)
     use_mock: bool = False
     debug_raw: bool = False
+
+
+class ActionStep(BaseModel):
+    step_id: str = Field(min_length=1, max_length=64)
+    tool: str = Field(min_length=1, max_length=120)
+    purpose: str = Field(min_length=1, max_length=500)
+    method: str | None = Field(default=None, max_length=12)
+    path: str | None = Field(default=None, max_length=300)
+    query: str | None = Field(default=None, max_length=1200)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionPlan(BaseModel):
+    objective: str = Field(min_length=1, max_length=800)
+    requires_search_first: bool = True
+    steps: list[ActionStep] = Field(default_factory=list, min_length=1, max_length=20)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class PlannerOutput(BaseModel):
+    plan: ActionPlan
+    search_context: list[dict[str, Any]] = Field(default_factory=list)
+    planner_notes: str | None = Field(default=None, max_length=4000)
+
+
+class ExecutionStepResult(BaseModel):
+    step_id: str
+    tool: str
+    status: Literal["ok", "error", "empty"]
+    result: Any = None
+    error: str | None = None
+
+
+class PipelineTrace(BaseModel):
+    run_id: str
+    mode: Literal["cautious", "balanced", "creative", "autonomous"]
+    planner_output: PlannerOutput
+    execution_results: list[ExecutionStepResult]
+    final_markdown: str
+    retry_count: int = 0
 
 
 class UserBootstrapRequest(BaseModel):

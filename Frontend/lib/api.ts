@@ -62,6 +62,7 @@ export async function startDeepTask(params: {
   userId: string;
   task: string;
   personaStats: PersonaStats;
+  workerCount?: number;
   notifyEmail?: string;
   useMock?: boolean;
 }) {
@@ -74,6 +75,7 @@ export async function startDeepTask(params: {
     body: JSON.stringify({
       task: params.task,
       persona_stats: params.personaStats,
+      worker_count: params.workerCount ?? 5,
       notify_email: params.notifyEmail ?? null,
       use_mock: params.useMock ?? false
     })
@@ -261,6 +263,9 @@ export async function agentChat(params: {
   threadId?: string | null;
   title?: string | null;
   mode: AutonomyMode;
+  aiProvider?: "claude" | "openai";
+  claudeModel?: string | null;
+  openaiModel?: string | null;
   personaStats?: PersonaStats | null;
   knowledgePrompt?: string | null;
   useMock?: boolean;
@@ -278,6 +283,9 @@ export async function agentChat(params: {
       thread_id: params.threadId ?? null,
       title: params.title ?? null,
       mode: params.mode,
+      ai_provider: params.aiProvider ?? "claude",
+      claude_model: params.claudeModel ?? null,
+      openai_model: params.openaiModel ?? null,
       persona_stats: params.personaStats ?? null,
       knowledge_prompt: params.knowledgePrompt ?? null,
       use_mock: params.useMock ?? false,
