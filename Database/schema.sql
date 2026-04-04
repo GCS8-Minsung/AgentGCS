@@ -120,6 +120,26 @@ create table if not exists public.agent_logs (
 create index if not exists idx_agent_logs_user_created on public.agent_logs(user_id, created_at desc);
 create index if not exists idx_agent_logs_run_id on public.agent_logs(run_id);
 
+-- sessions
+create table if not exists public.sessions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  status text not null default 'created',
+  autonomy_mode text,
+  trait_blob jsonb,
+  created_at timestamptz default now()
+);
+
+-- artifacts
+create table if not exists public.artifacts (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid references public.sessions(id) on delete cascade,
+  type text,
+  storage_link text,
+  meta jsonb,
+  created_at timestamptz default now()
+);
+
 -- shared updated_at trigger
 create or replace function public.set_updated_at()
 returns trigger
