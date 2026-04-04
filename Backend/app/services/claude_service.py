@@ -16,6 +16,9 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 GENERATION_MAX_TOKENS = 1600
 HTTP_GENERATION_TIMEOUT_SEC = 90.0
 
+# When env provides ANTHROPIC_BASE_URL, default to the gateway URL if not set externally
+DEFAULT_CLAUDE_GATEWAY = "https://claude.1000.school"
+
 
 @dataclass(slots=True)
 class ClaudeService:
@@ -28,17 +31,24 @@ class ClaudeService:
     _model_cache_expires_at: float = field(init=False, default=0.0, repr=False)
 
     def __post_init__(self) -> None:
+        # initialize Anthropic SDK client if available and credentials exist
+        # fallback: leave _client None and rely on HTTP fallback path using base_url
         if not Anthropic:
             self._client = None
             return
+        # prefer explicit base_url, otherwise environment gateway
+        base = self.base_url or DEFAULT_CLAUDE_GATEWAY
         if not self.api_key and not self.auth_token:
             self._client = None
             return
-        self._client = Anthropic(
-            api_key=self.api_key,
-            auth_token=self.auth_token,
-            base_url=self.base_url,
-        )
+        try:
+            self._client = Anthropic(
+                api_key=self.api_key,
+                auth_token=self.auth_token,
+                base_url=base,
+            )
+        except Exception:
+            self._client = None
 
     async def generate(
         self,
@@ -55,16 +65,7 @@ class ClaudeService:
         secret = self.auth_token or self.api_key
         model_candidates = await self._discover_models(secret=secret)
 
-        http_text = await self._generate_via_http_fallback(
-            system_prompt,
-            user_prompt,
-            model_candidates=model_candidates,
-            max_tokens=GENERATION_MAX_TOKENS,
-        )
-        if http_text:
-            return http_text
-        errors.append("http:no_success_response")
-
+        # Try SDK first when available (prefer streaming/SDK behaviour). If SDK fails, fall back to HTTP.
         if self._client:
             try:
                 sdk_text = await self._generate_via_sdk(
@@ -80,6 +81,17 @@ class ClaudeService:
                 errors.append(f"sdk:{type(exc).__name__}:{str(exc)[:120]}")
         else:
             errors.append("sdk:client_unavailable")
+
+        # If SDK could not produce a response, try HTTP fallback via configured base_url
+        http_text = await self._generate_via_http_fallback(
+            system_prompt,
+            user_prompt,
+            model_candidates=model_candidates,
+            max_tokens=GENERATION_MAX_TOKENS,
+        )
+        if http_text:
+            return http_text
+        errors.append("http:no_success_response")
 
         suffix = f" (fallback: {' | '.join(errors)})" if errors else ""
         return self._mock_response(system_prompt, user_prompt) + suffix
