@@ -64,6 +64,35 @@ export function GenerativeFeed({ events, running }: Props) {
             <p className="whitespace-pre-wrap text-sm text-gray-800">
               {formatPayload(event.payload)}
             </p>
+
+            {/* Render Drive/PPTX links if available in payload */}
+            {event.payload && typeof event.payload === "object" && (
+              (() => {
+                const p = event.payload as Record<string, any>;
+                const driveUrl = p?.drive?.drive_url || p?.drive?.webViewLink || p?.drive?.webContentLink;
+                if (driveUrl) {
+                  return (
+                    <p className="mt-2 text-sm">
+                      <a href={String(driveUrl)} target="_blank" rel="noreferrer" className="text-blue-600 underline">
+                        결과물 열기 (Google Drive)
+                      </a>
+                    </p>
+                  );
+                }
+                const scriptPath = p?.notebooklm?.script_path || p?.notebook?.script_path || p?.notebook?.script;
+                const pptPath = p?.notebooklm?.ppt_path || p?.notebook?.ppt_path || p?.notebooklm?.ppt;
+                if (scriptPath || pptPath) {
+                  return (
+                    <div className="mt-2 text-xs text-orange-900/70">
+                      {scriptPath && <div>스크립트: <span className="font-mono">{String(scriptPath)}</span></div>}
+                      {pptPath && <div>PPTX: <span className="font-mono">{String(pptPath)}</span></div>}
+                    </div>
+                  );
+                }
+                return null;
+              })()
+            )}
+
             {event.event_type === "deep_task.debate_turn" && (
               <p className="mt-2 text-xs text-orange-900/70">
                 Persona: {String(event.payload?.persona_label ?? "-")} / Score:{" "}
