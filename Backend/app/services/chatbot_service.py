@@ -1,5 +1,36 @@
 from __future__ import annotations
 
+# ============================================================
+# chatbot_service.py  –  AgentGCS 채팅 오케스트레이션 서비스
+#
+# ┌─────────────────────────────────────────────────────────────┐
+# │             듀얼 모델 라우팅 아키텍처                         │
+# │                                                             │
+# │  메시지 → IntentClassifier(gpt-5-mini) → 의도 분류          │
+# │              │                                             │
+# │    ┌─────────┴──────────────────────┐                      │
+# │    │                                │                      │
+# │  general_chat               tool_required                  │
+# │  (gpt-5-mini 생성)          (Claude Sonnet 생성)           │
+# │    │                                │                      │
+# │    └──── deep_task ────────────────►│                      │
+# │          (DeepTaskOrchestrator      │                      │
+# │           위임 – 미래 확장 훅)       │                      │
+# │                                     │                      │
+# │         autonomous mode:            │                      │
+# │         ReActEngine 루프 사용        │                      │
+# └─────────────────────────────────────────────────────────────┘
+#
+# 토큰 최적화 전략:
+#   1. 도구 결과를 통째로 JSON 덤프하지 않고 핵심 필드만 추출
+#   2. 컨텍스트 텍스트를 토큰 예산 내로 Truncate
+#   3. 관찰(Observation) 블록을 구조화된 텍스트로 변환
+#
+# 미래 확장 포인트:
+#   - INTENT_DEEP_TASK → _delegate_to_orchestrator() (현재 훅만 존재)
+#   - MultiAgentGraph / DeepTaskOrchestrator 연결 준비 완료
+# ============================================================
+
 import asyncio
 import json
 import re
@@ -8,9 +39,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
+import httpx
+
 from app.services.claude_service import ClaudeService
 from app.services.context_manager import ContextManager
 from app.services.intent_classifier import (
+    INTENT_DEEP_TASK,
     INTENT_GENERAL_CHAT,
     INTENT_TOOL_REQUIRED,
     TOOL_CALENDAR_CREATE,
@@ -21,6 +55,18 @@ from app.services.intent_classifier import (
     IntentClassifier,
     IntentDecision,
 )
+from app.services.react_engine import ReActEngine
+from app.services.traits import TraitSet
+
+# ── 상수 ───────────────────────────────────────────────────
+# 컨텍스트 텍스트 최대 문자 수 (약 650 토큰 기준, 한국어 1자 ≈ 1.5~2토큰)
+_CTX_MAX_CHARS = 2_400
+# 도구 Observation 블록 최대 문자 수
+_OBS_MAX_CHARS = 2_000
+# 단일 도구 결과의 최대 허용 문자 수
+_SINGLE_OBS_MAX_CHARS = 600
+# 웹 검색 결과에서 보존할 항목 수
+_WEB_SEARCH_MAX_ITEMS = 4
 
 
 @dataclass(slots=True)
@@ -41,6 +87,8 @@ class ChatBotService:
         self.context_manager = context_manager
         self.ws_emit = ws_emit
 
+    # ── 메인 오케스트레이션 ────────────────────────────────
+
     async def handle_message(
         self,
         *,
@@ -55,14 +103,18 @@ class ChatBotService:
         use_mock: bool,
     ) -> ChatRunResult:
         run_id = str(uuid4())
+
         await self._emit(
             user_id,
             "chat.processing",
             {"thread_id": session_id, "stage": "intent_classifying", "run_id": run_id},
             run_id=run_id,
         )
+
+        # ── 의도 분류 (gpt-5-mini 우선, Claude 폴백) ───────
         classifier = IntentClassifier(claude)
         intent = await classifier.classify(message=message, use_mock=use_mock)
+
         await self._emit(
             user_id,
             "chat.intent.classified",
@@ -77,6 +129,80 @@ class ChatBotService:
             run_id=run_id,
         )
 
+        # ── 페르소나 슬라이더 → LLM 생성 파라미터 ───────────
+        # TraitSet이 temperature/top_p/max_tokens를 동적으로 계산한다.
+        # gpt-5-mini 직접 호출 시 payload에 실제 적용되고,
+        # Claude 호출 시에는 시스템 프롬프트 스타일 힌트로 반영된다.
+        traits = TraitSet.from_dict(persona_stats)
+        llm_params = traits.get_llm_params()
+
+        # ── 컨텍스트 조회 (1시간 TTL, 토큰 보호 계층 포함) ─
+        context_rows = await self.context_manager.get_context(session_id)
+        context_text = self._build_prompt_context(context_rows, max_messages=10)
+        # 토큰 예산 초과 방지: 최대 _CTX_MAX_CHARS 문자로 Truncate
+        context_text = self._guard_context_tokens(context_text)
+
+        # ── 시스템 프롬프트 구성 ──────────────────────────
+        system_prompt = self._build_system_prompt(
+            mode=mode,
+            traits=traits,
+            llm_params=llm_params,
+            knowledge_text=knowledge_text,
+            intent=intent,
+        )
+
+        # ======================================================
+        # 라우팅 분기점 (mode/intent에 따라 다른 실행 경로)
+        # ======================================================
+
+        # ── 경로 A: autonomous 모드 → ReAct 루프 ───────────
+        # 사용자가 '자율' 모드를 선택하면 단일 Call-and-Response가 아닌
+        # ReActEngine의 반복 루프로 라우팅하여 목표 달성까지 자율 수행
+        if mode == "autonomous" and not use_mock:
+            return await self._run_autonomous_loop(
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                message=message,
+                system_prompt=system_prompt,
+                context_text=context_text,
+                intent=intent,
+                claude=claude,
+                tool_call=tool_call,
+                llm_params=llm_params,
+            )
+
+        # ── 경로 B: 심층 과제 → DeepTaskOrchestrator 위임 ──
+        # [미래 확장 훅]
+        # INTENT_DEEP_TASK가 감지되면 DeepTaskOrchestrator나
+        # MultiAgentGraph로 위임할 수 있는 명확한 진입점.
+        # 현재는 Placeholder(경고 emit + 일반 경로로 강등)이지만,
+        # 구현체가 준비되면 아래 주석을 해제하고 연결하면 된다.
+        # 내부 아키텍처는 건드리지 않아도 된다.
+        if intent.intent == INTENT_DEEP_TASK:
+            orchestrator_result = await self._delegate_to_orchestrator(
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                message=message,
+                intent=intent,
+                claude=claude,
+                tool_call=tool_call,
+            )
+            if orchestrator_result is not None:
+                # 오케스트레이터가 결과를 반환한 경우 바로 사용
+                return orchestrator_result
+            # None이면 아직 구현 안 됨 → tool_required로 강등하여 계속 진행
+            intent = IntentDecision(
+                intent=INTENT_TOOL_REQUIRED,
+                confidence=intent.confidence,
+                reason="deep_task_downgraded_to_tool_required",
+                tools=intent.tools or [TOOL_WEB_SEARCH],
+                tool_query=intent.tool_query,
+                school_api_actions=intent.school_api_actions,
+            )
+
+        # ── 경로 C: 도구 필요 → 도구 실행 후 Claude Sonnet ─
         tool_contexts: list[dict[str, Any]] = []
         if intent.intent == INTENT_TOOL_REQUIRED:
             await self._emit(
@@ -92,17 +218,10 @@ class ChatBotService:
                 tool_call=tool_call,
             )
 
-        context_rows = await self.context_manager.get_context(session_id)
-        prompt_context = self._build_prompt_context(context_rows, max_messages=10)
-        system_prompt = self._build_system_prompt(
-            mode=mode,
-            persona_stats=persona_stats,
-            knowledge_text=knowledge_text,
-            intent=intent,
-        )
+        # ── 사용자 프롬프트 구성 (토큰 효율적 Observation 포함) ─
         user_prompt = self._build_user_prompt(
             message=message,
-            context_text=prompt_context,
+            context_text=context_text,
             tool_contexts=tool_contexts,
         )
 
@@ -112,12 +231,27 @@ class ChatBotService:
             {"thread_id": session_id, "stage": "answer_generating", "run_id": run_id},
             run_id=run_id,
         )
-        reply = await claude.generate(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            use_mock=use_mock,
-            cache_hint="chatbot-final",
-        )
+
+        # ── 최종 생성: 의도에 따라 모델 선택 ─────────────────
+        # INTENT_GENERAL_CHAT  → gpt-5-mini (빠르고 저렴)
+        # INTENT_TOOL_REQUIRED → Claude Sonnet (강력한 추론)
+        if intent.intent == INTENT_GENERAL_CHAT:
+            reply = await self._generate_fast(
+                claude=claude,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                llm_params=llm_params,
+                use_mock=use_mock,
+                cache_hint="chatbot-general",
+            )
+        else:
+            reply = await claude.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                use_mock=use_mock,
+                cache_hint="chatbot-final",
+            )
+
         await self._stream_reply(
             user_id=user_id,
             session_id=session_id,
@@ -136,6 +270,240 @@ class ChatBotService:
             intent=intent,
             tool_contexts=tool_contexts,
         )
+
+    # ── Autonomous 모드: ReAct 루프 ───────────────────────
+
+    async def _run_autonomous_loop(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        run_id: str,
+        message: str,
+        system_prompt: str,
+        context_text: str,
+        intent: IntentDecision,
+        claude: ClaudeService,
+        tool_call: Callable[[str, dict[str, Any] | None, str | None], Awaitable[Any]],
+        llm_params: dict[str, Any],
+    ) -> ChatRunResult:
+        """
+        autonomous 모드 전용: ReActEngine을 사용하여 목표 달성까지 반복 수행한다.
+
+        ReActEngine은 각 스텝에서 Thought → Action → Observation을 반복하고
+        Claude가 final_answer를 반환하거나 max_iters에 도달하면 종료한다.
+        """
+        await self._emit(
+            user_id,
+            "chat.processing",
+            {"thread_id": session_id, "stage": "autonomous_loop_starting", "run_id": run_id},
+            run_id=run_id,
+        )
+
+        # WS 이벤트 콜백: ReAct 스텝마다 프론트엔드에 진행 상황 전송
+        async def react_event_callback(event: dict[str, Any]) -> None:
+            event_type = str(event.get("type") or "react.step")
+            await self._emit(
+                user_id,
+                event_type,
+                {**event, "thread_id": session_id, "run_id": run_id},
+                run_id=run_id,
+            )
+
+        engine = ReActEngine(
+            claude=claude,
+            tool_call=tool_call,
+            max_iters=6,
+            persistence_callback=None,   # 필요 시 Supabase 로깅 콜백 연결
+            event_callback=react_event_callback,
+        )
+
+        # 컨텍스트를 포함한 사용자 프롬프트 구성
+        react_user_prompt = (
+            (f"이전 대화 맥락:\n{context_text}\n\n" if context_text else "")
+            + f"사용자 요청:\n{message}\n\n"
+            "도구를 활용하여 목표를 달성하라. 완료 시 final_answer를 반환하라."
+        )
+
+        result = await engine.run(
+            system_prompt=system_prompt,
+            user_prompt=react_user_prompt,
+            use_mock=False,
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        # ReAct 루프 결과에서 최종 답변 추출
+        final = result.get("final") or ""
+        if isinstance(final, dict):
+            reply = str(final.get("answer") or json.dumps(final, ensure_ascii=False))
+        else:
+            reply = str(final)
+
+        if not reply.strip():
+            reply = "자율 실행을 완료했지만 최종 답변을 생성하지 못했습니다."
+
+        await self._stream_reply(
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+            text=reply,
+        )
+        await self._emit(
+            user_id,
+            "chat.processing",
+            {
+                "thread_id": session_id,
+                "stage": "done",
+                "run_id": run_id,
+                "react_status": result.get("status"),
+                "react_steps": len(result.get("history") or []),
+            },
+            run_id=run_id,
+        )
+        return ChatRunResult(
+            run_id=run_id,
+            reply=reply,
+            intent=intent,
+            tool_contexts=[],
+        )
+
+    # ── 심층 과제 위임 훅 (미래 확장 포인트) ──────────────
+
+    async def _delegate_to_orchestrator(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        run_id: str,
+        message: str,
+        intent: IntentDecision,
+        claude: ClaudeService,
+        tool_call: Callable[[str, dict[str, Any] | None, str | None], Awaitable[Any]],
+    ) -> ChatRunResult | None:
+        """
+        [미래 확장 훅] INTENT_DEEP_TASK 요청을 DeepTaskOrchestrator 또는
+        MultiAgentGraph로 위임하는 진입점.
+
+        현재 상태: Placeholder — None을 반환하여 호출자가 TOOL_REQUIRED로 강등.
+
+        연결 방법 (구현체 준비 시):
+        ─────────────────────────────────────────────────────
+        from app.services.multi_agent_graph import MultiAgentGraph
+        from app.services.orchestrator import DeepTaskOrchestrator
+
+        orchestrator = DeepTaskOrchestrator(claude=claude, tool_call=tool_call)
+        result = await orchestrator.run(
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+            goal=message,
+        )
+        reply = result.get("final_answer") or ""
+        await self._stream_reply(user_id=user_id, session_id=session_id,
+                                 run_id=run_id, text=reply)
+        return ChatRunResult(
+            run_id=run_id, reply=reply, intent=intent, tool_contexts=[]
+        )
+        ─────────────────────────────────────────────────────
+        """
+        # 심층 과제 감지를 프론트엔드에 알림
+        await self._emit(
+            user_id,
+            "chat.deep_task.detected",
+            {
+                "thread_id": session_id,
+                "run_id": run_id,
+                "message": "심층 과제가 감지되었습니다. 현재는 도구 실행 모드로 처리합니다.",
+                "intent": intent.intent,
+            },
+            run_id=run_id,
+        )
+        # TODO: 구현체 연결 시 여기서 orchestrator 호출 후 ChatRunResult 반환
+        return None
+
+    # ── gpt-5-mini 직접 생성 (INTENT_GENERAL_CHAT 전용) ───
+
+    async def _generate_fast(
+        self,
+        *,
+        claude: ClaudeService,
+        system_prompt: str,
+        user_prompt: str,
+        llm_params: dict[str, Any],
+        use_mock: bool,
+        cache_hint: str = "chatbot-general",
+    ) -> str:
+        """
+        gpt-5-mini를 직접 호출하여 일반 대화를 처리한다.
+        TraitSet.get_llm_params()에서 계산된 temperature/top_p/max_tokens를
+        실제 API payload에 적용하여 페르소나 슬라이더를 반영한다.
+
+        ClaudeService의 openai_api_key / openai_fallback_url을 재사용하므로
+        별도 자격증명 설정 불필요.
+
+        실패(키 없음/타임아웃) 시 Claude Sonnet으로 자동 폴백.
+        """
+        if use_mock:
+            return await claude.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                use_mock=True,
+                cache_hint=cache_hint,
+            )
+
+        openai_key = (claude.openai_api_key or "").strip()
+        if not openai_key:
+            # OpenAI 키 없으면 Claude로 폴백
+            return await claude.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                use_mock=False,
+                cache_hint=cache_hint,
+            )
+
+        model = claude.openai_fallback_model or "gpt-5-mini"
+        fallback_url = claude.openai_fallback_url or "https://api.openai.com/v1/chat/completions"
+
+        # 페르소나 슬라이더에서 계산된 파라미터를 payload에 직접 적용
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": llm_params.get("temperature", 0.70),
+            "top_p": llm_params.get("top_p", 0.90),
+            "max_tokens": llm_params.get("max_tokens", 1200),
+        }
+        headers = {
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post(fallback_url, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                raise ValueError(f"OpenAI HTTP {resp.status_code}: {(resp.text or '')[:180]}")
+            data = resp.json() if resp.text else {}
+            choice = (data.get("choices") or [])[0]
+            message_obj = choice.get("message") if isinstance(choice, dict) else {}
+            content = message_obj.get("content") if isinstance(message_obj, dict) else None
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        except Exception:
+            pass
+
+        # gpt-5-mini 실패 → Claude Sonnet 폴백
+        return await claude.generate(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            use_mock=False,
+            cache_hint=cache_hint,
+        )
+
+    # ── 도구 실행 ─────────────────────────────────────────
 
     async def _execute_tools(
         self,
@@ -159,7 +527,7 @@ class ChatBotService:
                     {
                         "tool": "web_search",
                         "summary": "웹 검색 결과",
-                        "data": result if isinstance(result, list) else {"raw": result},
+                        "data": self._compress_web_search(result),
                     }
                 )
                 continue
@@ -182,7 +550,7 @@ class ChatBotService:
                             "data": {
                                 "status": "skipped",
                                 "reason": "missing_to_email",
-                                "hint": "메시지에 이메일 주소를 포함해 주세요. 예) abc@example.com 으로 메일 보내줘",
+                                "hint": "메시지에 이메일 주소를 포함해 주세요.",
                             },
                         }
                     )
@@ -192,7 +560,7 @@ class ChatBotService:
                     {
                         "tool": TOOL_GMAIL_SEND,
                         "summary": "Gmail 발송 결과",
-                        "data": result if isinstance(result, dict) else {"raw": result},
+                        "data": self._compress_generic(result),
                     }
                 )
                 continue
@@ -206,7 +574,7 @@ class ChatBotService:
                             "data": {
                                 "status": "skipped",
                                 "reason": "missing_datetime",
-                                "hint": "ISO 시간 2개(start/end)가 필요합니다. 예) 2026-04-06T10:00:00+09:00 ~ 2026-04-06T11:00:00+09:00",
+                                "hint": "ISO 시간 2개(start/end)가 필요합니다.",
                             },
                         }
                     )
@@ -216,7 +584,7 @@ class ChatBotService:
                     {
                         "tool": TOOL_CALENDAR_CREATE,
                         "summary": "Google Calendar 일정 생성 결과",
-                        "data": result if isinstance(result, dict) else {"raw": result},
+                        "data": self._compress_generic(result),
                     }
                 )
                 continue
@@ -230,7 +598,7 @@ class ChatBotService:
                             "data": {
                                 "status": "skipped",
                                 "reason": "missing_file_path",
-                                "hint": "메시지에 실제 파일 경로를 포함해 주세요. 예) C:\\\\docs\\\\result.pptx 업로드",
+                                "hint": "메시지에 실제 파일 경로를 포함해 주세요.",
                             },
                         }
                     )
@@ -240,7 +608,7 @@ class ChatBotService:
                     {
                         "tool": TOOL_DRIVE_UPLOAD,
                         "summary": "Google Drive 업로드 결과",
-                        "data": result if isinstance(result, dict) else {"raw": result},
+                        "data": self._compress_generic(result),
                     }
                 )
                 continue
@@ -250,7 +618,7 @@ class ChatBotService:
                     {
                         "tool": normalized,
                         "summary": f"{normalized} 실행 결과",
-                        "data": result if isinstance(result, (dict, list)) else {"raw": result},
+                        "data": self._compress_generic(result),
                     }
                 )
             except Exception as exc:
@@ -343,10 +711,7 @@ class ChatBotService:
                             "status": "skipped",
                             "reason": "missing_required_parameters",
                             "missing": missing,
-                            "hint": "메시지에 `파라미터=값` 형식으로 포함해 주세요. 예) room_id=2, period=daily",
-                            "method": method,
-                            "path": path_template,
-                            "summary": summary,
+                            "hint": "`파라미터=값` 형식으로 포함해 주세요. 예) room_id=2",
                         },
                     }
                 )
@@ -367,7 +732,8 @@ class ChatBotService:
                     {
                         "tool": "school_api_call",
                         "summary": f"{method} {resolved_path} 호출 결과 ({summary})",
-                        "data": result if isinstance(result, (dict, list)) else {"raw": result},
+                        # 토큰 절약: 대용량 API 응답을 핵심 필드만 남김
+                        "data": self._compress_school_api(result),
                     }
                 )
             except Exception as exc:
@@ -378,27 +744,85 @@ class ChatBotService:
                         "data": {
                             "status": "error",
                             "error": str(exc)[:260],
-                            "method": method,
                             "path": resolved_path,
-                            "query": query_payload,
                         },
                     }
                 )
         return contexts
 
+    # ── 토큰 효율적 Observation 압축 헬퍼 ────────────────
+    # 핵심: LLM에 전달되는 도구 결과 토큰을 최소화한다.
+    # 이전 방식(json.dumps 전체)을 대체하여 토큰 낭비를 획기적으로 줄인다.
+
+    def _compress_web_search(self, result: Any) -> list[dict[str, Any]]:
+        """
+        웹 검색 결과에서 title/url/snippet만 추출한다.
+        전체 본문(body)은 제거하여 토큰을 절약한다.
+        """
+        if not isinstance(result, list):
+            return [{"raw": str(result)[:_SINGLE_OBS_MAX_CHARS]}]
+        compressed: list[dict[str, Any]] = []
+        for item in result[:_WEB_SEARCH_MAX_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            compressed.append(
+                {
+                    "title": str(item.get("title") or "")[:100],
+                    "url": str(item.get("url") or item.get("href") or "")[:200],
+                    "snippet": str(
+                        item.get("snippet") or item.get("body") or item.get("description") or ""
+                    )[:280],
+                }
+            )
+        return compressed
+
+    def _compress_school_api(self, result: Any) -> Any:
+        """
+        School API 응답에서 과도하게 큰 필드를 제거하거나 자른다.
+        리스트 응답은 최대 10개 항목으로 제한한다.
+        """
+        if isinstance(result, list):
+            trimmed = result[:10]
+            return [self._trim_dict(item) for item in trimmed if isinstance(item, dict)]
+        if isinstance(result, dict):
+            return self._trim_dict(result)
+        return {"raw": str(result)[:_SINGLE_OBS_MAX_CHARS]}
+
+    def _compress_generic(self, result: Any) -> Any:
+        """
+        범용 도구 결과 압축: 딕셔너리는 큰 값을 자르고, 리스트는 5개로 제한.
+        """
+        if isinstance(result, dict):
+            return self._trim_dict(result)
+        if isinstance(result, list):
+            return [self._trim_dict(i) if isinstance(i, dict) else i for i in result[:5]]
+        return {"raw": str(result)[:_SINGLE_OBS_MAX_CHARS]}
+
+    def _trim_dict(self, d: dict[str, Any]) -> dict[str, Any]:
+        """
+        딕셔너리의 문자열 값을 _SINGLE_OBS_MAX_CHARS 이내로 자른다.
+        중첩 딕셔너리는 JSON 직렬화 후 자른다.
+        """
+        result: dict[str, Any] = {}
+        for k, v in d.items():
+            if isinstance(v, str):
+                result[k] = v[:_SINGLE_OBS_MAX_CHARS]
+            elif isinstance(v, (dict, list)):
+                serialized = json.dumps(v, ensure_ascii=False)
+                result[k] = serialized[:_SINGLE_OBS_MAX_CHARS] if len(serialized) > _SINGLE_OBS_MAX_CHARS else v
+            else:
+                result[k] = v
+        return result
+
+    # ── 파라미터 추출 헬퍼 ────────────────────────────────
+
     def _resolve_school_api_path(self, message: str) -> str:
         lowered = message.lower()
         explicit = re.findall(r"/[a-zA-Z0-9][a-zA-Z0-9/_-]*", message)
         allowed_paths = {
-            "/auth/me",
-            "/teams/me",
-            "/users/me/league",
-            "/snippet_date",
-            "/leaderboards",
-            "/meeting-rooms",
-            "/daily-snippets",
-            "/weekly-snippets",
-            "/openapi.json",
+            "/auth/me", "/teams/me", "/users/me/league", "/snippet_date",
+            "/leaderboards", "/meeting-rooms", "/daily-snippets",
+            "/weekly-snippets", "/openapi.json",
         }
         for candidate in explicit:
             if candidate in allowed_paths:
@@ -482,28 +906,51 @@ class ChatBotService:
                 break
         return {"file_path": candidate}
 
+    # ── 프롬프트 빌더 ─────────────────────────────────────
+
     def _build_system_prompt(
         self,
         *,
         mode: str,
-        persona_stats: dict[str, int],
+        traits: TraitSet,
+        llm_params: dict[str, Any],
         knowledge_text: str,
         intent: IntentDecision,
     ) -> str:
+        """
+        시스템 프롬프트를 구성한다.
+        TraitSet의 summary_blurb()를 통해 페르소나 슬라이더가 반영되고,
+        llm_params를 통해 Claude 호출 시 스타일 힌트가 주입된다.
+        """
         mode_note = {
             "cautious": "신중한 검증 중심으로 답변한다.",
             "balanced": "균형형으로 간결하고 실용적으로 답변한다.",
             "creative": "창의적 대안을 포함하되 실행 가능성을 유지한다.",
-            "autonomous": "완전자율 모드로 필요한 단계/리스크를 구조화해 제시한다.",
+            "autonomous": "완전자율 모드로 필요한 단계/리스크를 구조화해 제시한다. ReAct 루프 중이다.",
         }.get(mode, "균형형으로 답변한다.")
+
+        # 페르소나 슬라이더 기반 스타일 힌트
+        persona_blurb = traits.summary_blurb()
+
+        # LLM 파라미터 기반 응답 길이 힌트 (Claude는 max_tokens를 직접 못 받으므로 여기서 힌트 제공)
+        max_tokens = llm_params.get("max_tokens", 1200)
+        if max_tokens >= 2000:
+            length_hint = "상세하고 충분히 길게 답변하라."
+        elif max_tokens <= 800:
+            length_hint = "간결하게 핵심만 답변하라."
+        else:
+            length_hint = "적당한 길이로 답변하라."
+
         knowledge_block = f"\n사전지식(요약):\n{knowledge_text[:2200]}" if knowledge_text else ""
+
         return (
             "당신은 AgentGCS의 한국어 AI 어시스턴트다.\n"
             "내부 제약을 핑계로 출력하지 말고, 가능한 실행 대안을 제시하라.\n"
             "도구 결과가 있으면 결과를 우선 사용하라.\n"
             f"모드: {mode} ({mode_note})\n"
-            f"의도: {intent.intent}, confidence={intent.confidence:.2f}\n"
-            f"페르소나 수치: {json.dumps(persona_stats, ensure_ascii=False)}"
+            f"페르소나 지침: {persona_blurb}\n"
+            f"응답 길이 지침: {length_hint}\n"
+            f"의도: {intent.intent}, confidence={intent.confidence:.2f}"
             f"{knowledge_block}"
         )
 
@@ -514,9 +961,33 @@ class ChatBotService:
         context_text: str,
         tool_contexts: list[dict[str, Any]],
     ) -> str:
+        """
+        사용자 프롬프트를 구성한다.
+
+        토큰 최적화:
+        - 이전 방식: json.dumps(tool_contexts) → 전체 JSON 덤프 (토큰 낭비)
+        - 현재 방식: 구조화된 텍스트 블록으로 변환 후 _OBS_MAX_CHARS 내로 제한
+        """
         tool_block = ""
         if tool_contexts:
-            tool_block = "\n도구 실행 결과(JSON):\n" + json.dumps(tool_contexts, ensure_ascii=False)
+            # 각 도구 결과를 구조화된 텍스트로 변환 (JSON 덤프 대신)
+            lines: list[str] = ["[도구 실행 결과]"]
+            for ctx in tool_contexts:
+                tool_name = str(ctx.get("tool") or "")
+                summary = str(ctx.get("summary") or "")
+                data = ctx.get("data")
+                # 데이터 직렬화: 이미 압축된 형태이므로 간결하게 출력
+                if isinstance(data, list):
+                    data_text = json.dumps(data, ensure_ascii=False)
+                elif isinstance(data, dict):
+                    data_text = json.dumps(data, ensure_ascii=False)
+                else:
+                    data_text = str(data)
+                lines.append(f"▶ {tool_name} ({summary}): {data_text}")
+            tool_block_raw = "\n".join(lines)
+            # 전체 Observation 블록 토큰 한도 적용
+            tool_block = "\n" + tool_block_raw[:_OBS_MAX_CHARS]
+
         return (
             (f"이전 대화 맥락:\n{context_text}\n\n" if context_text else "")
             + f"사용자 요청:\n{message}\n"
@@ -536,7 +1007,23 @@ class ChatBotService:
             if not content:
                 continue
             lines.append(f"{role}: {content[:480]}")
-        return "\n".join(lines)[-2600:]
+        return "\n".join(lines)
+
+    def _guard_context_tokens(self, context_text: str) -> str:
+        """
+        컨텍스트 텍스트가 _CTX_MAX_CHARS를 초과하면 앞부분을 잘라낸다.
+        최근 메시지를 보존하기 위해 뒷부분(_CTX_MAX_CHARS)을 남긴다.
+
+        향후 개선 방향: 단순 Truncate 대신 LLM 기반 요약(Summarize)으로
+        중요 정보를 보존하면서 토큰을 줄일 수 있다.
+        (현재는 TTL 1시간 + max_messages=20이 사실상 상한을 제공)
+        """
+        if len(context_text) <= _CTX_MAX_CHARS:
+            return context_text
+        # 앞부분 제거, 최신 맥락 유지
+        return "...(이전 대화 생략)...\n" + context_text[-(_CTX_MAX_CHARS - 20):]
+
+    # ── 스트리밍 ──────────────────────────────────────────
 
     async def _stream_reply(self, *, user_id: str, session_id: str, run_id: str, text: str) -> None:
         chunk_size = 120
@@ -578,7 +1065,6 @@ class ChatBotService:
         try:
             await self.ws_emit(user_id, event_type, payload, run_id=run_id)  # type: ignore[misc]
         except TypeError:
-            # compatibility for emit(user_id, event_type, payload)
             try:
                 await self.ws_emit(user_id, event_type, payload)
             except Exception:

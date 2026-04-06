@@ -17,33 +17,59 @@ async function request<T>(
   path: string,
   userId: string,
   options?: RequestInit,
-  timeoutMs?: number
+  timeoutMs?: number,
+  networkRetryCount = 0
 ): Promise<T> {
-  const controller = new AbortController();
   const effectiveTimeoutMs = timeoutMs ?? REQUEST_TIMEOUT_MS;
-  const timeout = window.setTimeout(() => controller.abort(), effectiveTimeoutMs);
-  let response: Response;
-  try {
-    response = await fetch(`${backendUrl}${path}`, {
-      ...options,
-      signal: options?.signal ?? controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "x-user-id": userId,
-        ...(options?.headers ?? {})
+  let response: Response | null = null;
+  let lastNetworkError: Error | null = null;
+  for (let attempt = 0; attempt <= networkRetryCount; attempt += 1) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, effectiveTimeoutMs);
+    try {
+      response = await fetch(`${backendUrl}${path}`, {
+        ...options,
+        signal: options?.signal ?? controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "x-user-id": userId,
+          ...(options?.headers ?? {})
+        }
+      });
+      lastNetworkError = null;
+      break;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        if (!timedOut) {
+          throw new Error("요청이 중단되었습니다.");
+        }
+        throw new Error(
+          `요청 시간 초과 (${Math.floor(effectiveTimeoutMs / 1000)}초): ${backendUrl}${path}. 백엔드 상태를 확인해주세요.`
+        );
       }
-    });
-  } catch (error) {
-    if ((error as Error).name === "AbortError") {
+      lastNetworkError = error as Error;
+      if (attempt < networkRetryCount) {
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        continue;
+      }
       throw new Error(
-        `요청 시간 초과 (${Math.floor(effectiveTimeoutMs / 1000)}초): ${backendUrl}${path}. 백엔드 상태를 확인해주세요.`
+        `백엔드 연결 실패 (${backendUrl}). 백엔드 주소/포트와 CORS 설정을 확인해주세요. ${(error as Error).message}`
       );
+    } finally {
+      window.clearTimeout(timeout);
     }
+  }
+
+  if (!response) {
     throw new Error(
-      `백엔드 연결 실패 (${backendUrl}). 백엔드 서버(8000)가 실행 중인지 확인해주세요. ${(error as Error).message}`
+      `백엔드 연결 실패 (${backendUrl}). 백엔드 주소/포트와 CORS 설정을 확인해주세요. ${
+        lastNetworkError?.message ?? "unknown network error"
+      }`
     );
-  } finally {
-    window.clearTimeout(timeout);
   }
 
   if (!response.ok) {
@@ -63,6 +89,7 @@ export async function startDeepTask(params: {
   task: string;
   personaStats: PersonaStats;
   workerCount?: number;
+  triggerSource?: "console" | "chat";
   notifyEmail?: string;
   useMock?: boolean;
 }) {
@@ -76,10 +103,22 @@ export async function startDeepTask(params: {
       task: params.task,
       persona_stats: params.personaStats,
       worker_count: params.workerCount ?? 5,
+      trigger_source: params.triggerSource ?? "console",
       notify_email: params.notifyEmail ?? null,
       use_mock: params.useMock ?? false
     })
-  });
+  }, undefined, 1);
+}
+
+export async function cancelDeepTask(params: {
+  userId: string;
+  runId: string;
+}) {
+  return request<{ run_id: string; status: string }>(
+    `/api/agents/deep-task/${encodeURIComponent(params.runId)}/cancel`,
+    params.userId,
+    { method: "POST" }
+  );
 }
 
 export async function orchestratorRun(params: {
@@ -270,20 +309,37 @@ export async function agentChat(params: {
   knowledgePrompt?: string | null;
   useMock?: boolean;
   debugRaw?: boolean;
+  signal?: AbortSignal;
 }) {
   return request<{
     thread_id: string;
     reply: string;
     assistant_message: ConversationMessage;
     mode: AutonomyMode;
+    intent?: {
+      intent?: string;
+      confidence?: number;
+      reason?: string;
+      tools?: string[];
+    } | null;
+    deep_task_candidate?: {
+      task: string;
+      trigger_source: "chat";
+      persona_count: number;
+      worker_count: number;
+      discussion_rounds: number;
+      can_start: boolean;
+      reason?: string;
+    } | null;
   }>("/api/agents/chat", params.userId, {
     method: "POST",
+    signal: params.signal,
     body: JSON.stringify({
       message: params.message,
       thread_id: params.threadId ?? null,
       title: params.title ?? null,
       mode: params.mode,
-      ai_provider: params.aiProvider ?? "claude",
+      ai_provider: params.aiProvider ?? null,
       claude_model: params.claudeModel ?? null,
       openai_model: params.openaiModel ?? null,
       persona_stats: params.personaStats ?? null,

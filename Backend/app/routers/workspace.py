@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from copy import deepcopy
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends
@@ -12,12 +14,16 @@ from app.core.supabase_client import get_supabase_admin
 from app.dependencies import context_manager
 from app.models.schemas import (
     ConversationMessageCreateRequest,
+    PersonaProfile,
     ConversationThreadCreateRequest,
     UserSettingsPayload,
 )
 from app.services.dev_store import DEFAULT_PERSONA, DEFAULT_SETTINGS, dev_store
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
+MAX_TASK_PERSONAS = 6
+MIN_DISCUSSION_ROUNDS = 2
+MAX_DISCUSSION_ROUNDS = 5
 
 
 def _placeholder_email(user_id: str) -> str:
@@ -54,8 +60,50 @@ def _default_settings_payload() -> dict:
             or (DEFAULT_SETTINGS.get("personas") or [DEFAULT_PERSONA])[0]["id"]
         ),
         "chat_mode_personas": default_chat_mode_personas,
+        "discussion_rounds": int(DEFAULT_SETTINGS.get("discussion_rounds") or 3),
         "knowledge_base_prompt": DEFAULT_SETTINGS.get("knowledge_base_prompt"),
     }
+
+
+def _normalize_personas(raw_personas: object) -> list[dict]:
+    candidates = raw_personas if isinstance(raw_personas, list) else []
+    default_profile = PersonaProfile(**deepcopy(DEFAULT_PERSONA))
+
+    normalized: list[dict] = [default_profile.model_dump(mode="json")]
+    seen_ids = {default_profile.id}
+
+    for index, row in enumerate(candidates):
+        if len(normalized) >= MAX_TASK_PERSONAS:
+            break
+        if not isinstance(row, dict):
+            continue
+
+        raw_id = str(row.get("id") or "").strip()
+        if not raw_id or raw_id == default_profile.id or raw_id in seen_ids:
+            continue
+
+        raw_name = str(row.get("name") or "").strip()
+        if not raw_name:
+            raw_name = f"에이전트 {index + 1}"
+
+        stats = row.get("stats")
+        try:
+            profile = PersonaProfile(id=raw_id, name=raw_name, stats=stats)
+        except Exception:
+            continue
+
+        normalized.append(profile.model_dump(mode="json"))
+        seen_ids.add(profile.id)
+
+    return normalized
+
+
+def _normalize_discussion_rounds(value: object) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(DEFAULT_SETTINGS.get("discussion_rounds") or 3)
+    return max(MIN_DISCUSSION_ROUNDS, min(MAX_DISCUSSION_ROUNDS, parsed))
 
 
 def _normalize_settings(raw: dict | None) -> dict:
@@ -74,12 +122,22 @@ def _normalize_settings(raw: dict | None) -> dict:
         merged["knowledge_base_prompt"] = None
     if not merged.get("knowledge_base_prompt"):
         merged["knowledge_base_prompt"] = DEFAULT_AGENTGCS_GUIDELINE
-    personas = merged.get("personas")
-    if not isinstance(personas, list) or not personas:
-        personas = [deepcopy(DEFAULT_PERSONA)]
-        merged["personas"] = personas
-    if not merged.get("active_persona_id"):
-        merged["active_persona_id"] = personas[0]["id"]
+    notebook_profile = str(merged.get("notebooklm_profile") or "").strip()
+    merged["notebooklm_profile"] = notebook_profile or None
+    merged["notebooklm_allow_oauth_mismatch"] = bool(
+        merged.get("notebooklm_allow_oauth_mismatch", True)
+    )
+    merged["notebooklm_auto_switch_on_slide_failure"] = bool(
+        merged.get("notebooklm_auto_switch_on_slide_failure", True)
+    )
+    personas = _normalize_personas(merged.get("personas"))
+    merged["personas"] = personas
+
+    requested_active_id = str(merged.get("active_persona_id") or "").strip()
+    valid_ids = {persona["id"] for persona in personas if isinstance(persona, dict)}
+    if requested_active_id not in valid_ids:
+        requested_active_id = personas[0]["id"]
+    merged["active_persona_id"] = requested_active_id
 
     chat_mode_personas = merged.get("chat_mode_personas")
     if not isinstance(chat_mode_personas, dict):
@@ -88,8 +146,115 @@ def _normalize_settings(raw: dict | None) -> dict:
         if not isinstance(chat_mode_personas.get(mode), dict):
             chat_mode_personas[mode] = deepcopy(DEFAULT_PERSONA["stats"])
     merged["chat_mode_personas"] = chat_mode_personas
+    merged["discussion_rounds"] = _normalize_discussion_rounds(merged.get("discussion_rounds"))
 
     return UserSettingsPayload(**merged).model_dump(mode="json")
+
+
+def _is_placeholder_thread_title(title: str | None) -> bool:
+    normalized = re.sub(r"\s+", " ", str(title or "").strip())
+    if not normalized:
+        return True
+    return normalized.startswith("새 대화") or normalized.startswith("새 워크플로우")
+
+
+def _derive_thread_title(content: str, *, max_len: int = 42) -> str:
+    compact = re.sub(r"\s+", " ", (content or "").strip())
+    if not compact:
+        return "새 대화"
+    return compact[:max_len]
+
+
+async def _latest_user_message_content(user_id: str, thread_id: str) -> str | None:
+    try:
+        def _select():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_messages")
+                .select("content")
+                .eq("user_id", user_id)
+                .eq("thread_id", thread_id)
+                .eq("role", "user")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+        result = await asyncio.to_thread(_select)
+        row = (result.data or [None])[0]
+        if row and isinstance(row.get("content"), str) and row.get("content"):
+            return str(row["content"])
+    except Exception:
+        pass
+
+    try:
+        local_rows = await dev_store.list_messages(user_id, thread_id, limit=80)
+        for row in reversed(local_rows):
+            if str(row.get("role") or "") != "user":
+                continue
+            content = str(row.get("content") or "").strip()
+            if content:
+                return content
+    except Exception:
+        pass
+    return None
+
+
+async def _sync_thread_title_from_message(
+    *,
+    user_id: str,
+    thread_id: str,
+    role: str,
+    content: str,
+) -> None:
+    if role not in {"user", "assistant"}:
+        return
+    candidate_content = content
+    if role == "assistant":
+        latest_user = await _latest_user_message_content(user_id, thread_id)
+        if latest_user:
+            candidate_content = latest_user
+    candidate = _derive_thread_title(candidate_content)
+    if not candidate:
+        return
+
+    try:
+        local_thread = await dev_store.get_thread(user_id, thread_id)
+        if local_thread and _is_placeholder_thread_title(str(local_thread.get("title") or "")):
+            await dev_store.ensure_thread(user_id, thread_id, candidate)
+    except Exception:
+        pass
+
+    try:
+        def _select_thread():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_threads")
+                .select("id,title")
+                .eq("id", thread_id)
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+
+        selected = await asyncio.to_thread(_select_thread)
+        row = (selected.data or [None])[0]
+        if not row or not _is_placeholder_thread_title(str(row.get("title") or "")):
+            return
+
+        def _update_thread():
+            client = get_supabase_admin()
+            return (
+                client.table("chat_threads")
+                .update({"title": candidate, "updated_at": datetime.now(tz=timezone.utc).isoformat()})
+                .eq("id", thread_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+
+        await asyncio.to_thread(_update_thread)
+    except Exception:
+        return
 
 
 @router.get("/settings")
@@ -273,6 +438,22 @@ async def create_conversation_message(
     body: ConversationMessageCreateRequest,
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
+    async def _touch_thread_updated_at() -> None:
+        try:
+            def _update():
+                client = get_supabase_admin()
+                return (
+                    client.table("chat_threads")
+                    .update({"updated_at": datetime.now(tz=timezone.utc).isoformat()})
+                    .eq("id", thread_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+
+            await asyncio.to_thread(_update)
+        except Exception:
+            return
+
     await _ensure_supabase_user(user_id)
     await dev_store.ensure_thread(user_id, thread_id, "새 대화")
     local_row = await dev_store.append_message(
@@ -297,8 +478,22 @@ async def create_conversation_message(
 
         result = await asyncio.to_thread(_insert)
         row = (result.data or [local_row])[0]
+        await _touch_thread_updated_at()
+        await _sync_thread_title_from_message(
+            user_id=user_id,
+            thread_id=thread_id,
+            role=body.role,
+            content=body.content,
+        )
         return {"item": row, "source": "supabase"}
     except Exception:
+        await _touch_thread_updated_at()
+        await _sync_thread_title_from_message(
+            user_id=user_id,
+            thread_id=thread_id,
+            role=body.role,
+            content=body.content,
+        )
         return {"item": local_row, "source": "dev_store"}
 
 

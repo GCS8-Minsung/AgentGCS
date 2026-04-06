@@ -73,6 +73,10 @@ DEFAULT_SETTINGS = {
     },
     "active_persona_id": DEFAULT_PERSONA["id"],
     "personas": [DEFAULT_PERSONA],
+    "discussion_rounds": 3,
+    "notebooklm_profile": None,
+    "notebooklm_allow_oauth_mismatch": True,
+    "notebooklm_auto_switch_on_slide_failure": True,
 }
 
 
@@ -186,6 +190,11 @@ class DevStore:
             rows = list(self._threads.get(user_id, {}).values())
             rows.sort(key=lambda row: row.get("updated_at", ""), reverse=True)
             return deepcopy(rows[:limit])
+
+    async def get_thread(self, user_id: str, thread_id: str) -> dict | None:
+        async with self._lock:
+            row = self._threads.get(user_id, {}).get(thread_id)
+            return deepcopy(row) if row else None
 
     async def delete_thread(self, user_id: str, thread_id: str) -> bool:
         async with self._lock:

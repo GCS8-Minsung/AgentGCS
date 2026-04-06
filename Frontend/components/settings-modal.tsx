@@ -41,6 +41,24 @@ type ConnectionSnapshot = {
     oauth_configured?: boolean;
     token_expired?: boolean;
     refresh_available?: boolean;
+    connected_account?: {
+      email?: string | null;
+      name?: string | null;
+      sub?: string | null;
+      verified_email?: boolean;
+    };
+    drive_mapping?: {
+      input_folder_id?: string | null;
+      output_folder_id?: string | null;
+      configured?: boolean;
+      input_configured?: boolean;
+      output_configured?: boolean;
+    };
+    service_account?: {
+      project_id?: string | null;
+      client_email?: string | null;
+      configured?: boolean;
+    };
     services?: {
       drive?: { status?: string; http_status?: number; reason?: string };
       gmail?: { status?: string; http_status?: number; reason?: string };
@@ -84,6 +102,10 @@ const CHAT_MODE_LABELS: Record<AutonomyMode, string> = {
   creative: "창의적",
   autonomous: "완전자율"
 };
+const RESERVED_PERSONA_ID = "default-balanced";
+const MAX_TASK_PERSONAS = 6;
+const MIN_DISCUSSION_ROUNDS = 2;
+const MAX_DISCUSSION_ROUNDS = 5;
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const GOOGLE_CLIENT_ID =
@@ -157,6 +179,49 @@ function normalizeChatModePersonas(
   };
 }
 
+function normalizeDiscussionRounds(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 3;
+  const rounded = Math.round(numeric);
+  return Math.max(MIN_DISCUSSION_ROUNDS, Math.min(MAX_DISCUSSION_ROUNDS, rounded));
+}
+
+function normalizeTaskPersonas(source: PersonaProfile[] | undefined): PersonaProfile[] {
+  const rows = Array.isArray(source) ? source : [];
+  const normalized: PersonaProfile[] = [];
+  const seen = new Set<string>();
+
+  const defaultPersona = rows.find((row) => row?.id === RESERVED_PERSONA_ID);
+  const fallbackDefault: PersonaProfile = {
+    id: RESERVED_PERSONA_ID,
+    name: "기본 균형형",
+    stats: { ...EMPTY_STATS }
+  };
+  const ensuredDefault = defaultPersona
+    ? {
+        ...defaultPersona,
+        id: RESERVED_PERSONA_ID,
+        name: defaultPersona.name?.trim() || "기본 균형형",
+        stats: normalizePersonaStats(defaultPersona.stats)
+      }
+    : fallbackDefault;
+  normalized.push(ensuredDefault);
+  seen.add(RESERVED_PERSONA_ID);
+
+  for (const row of rows) {
+    if (!row?.id || seen.has(row.id)) continue;
+    if (normalized.length >= MAX_TASK_PERSONAS) break;
+    normalized.push({
+      ...row,
+      id: row.id,
+      name: row.name?.trim() || row.id,
+      stats: normalizePersonaStats(row.stats)
+    });
+    seen.add(row.id);
+  }
+  return normalized;
+}
+
 function extractBearerToken(raw: string): string {
   const text = raw.trim();
   if (!text) return "";
@@ -211,6 +276,10 @@ export const SettingsModal = memo(function SettingsModal({
   const [openAiApiToken, setOpenAiApiToken] = useState("");
   const [googleClientIdInput, setGoogleClientIdInput] = useState("");
   const [googleClientSecretInput, setGoogleClientSecretInput] = useState("");
+  const [googleDriveInputFolderId, setGoogleDriveInputFolderId] = useState("");
+  const [googleDriveOutputFolderId, setGoogleDriveOutputFolderId] = useState("");
+  const [serviceAccountProjectId, setServiceAccountProjectId] = useState("");
+  const [serviceAccountClientEmail, setServiceAccountClientEmail] = useState("");
   const [googleReady, setGoogleReady] = useState(false);
   const [googleConnecting, setGoogleConnecting] = useState(false);
   const [dbConnecting, setDbConnecting] = useState(false);
@@ -220,17 +289,23 @@ export const SettingsModal = memo(function SettingsModal({
   const [localSavedKeyNames, setLocalSavedKeyNames] = useState<string[]>([]);
   const [activeChatMode, setActiveChatMode] = useState<AutonomyMode>("balanced");
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const selectedProvider = draftSettings.ai_provider ?? "claude";
+  const showDevDetails = Boolean(draftSettings.dev_mode);
 
   useEffect(() => {
     if (!open) return;
-    const normalizedPersonas = (settings.personas ?? []).map((persona) => ({
-      ...persona,
-      stats: normalizePersonaStats(persona.stats)
-    }));
+    const normalizedPersonas = normalizeTaskPersonas(settings.personas);
     setDraftSettings({
       ...settings,
-      personas: normalizedPersonas.length > 0 ? normalizedPersonas : settings.personas,
+      personas: normalizedPersonas,
+      active_persona_id:
+        normalizedPersonas.find((persona) => persona.id === settings.active_persona_id)?.id ??
+        normalizedPersonas[0]?.id ??
+        RESERVED_PERSONA_ID,
+      discussion_rounds: normalizeDiscussionRounds(settings.discussion_rounds),
+      notebooklm_profile: settings.notebooklm_profile?.trim() || null,
+      notebooklm_allow_oauth_mismatch: settings.notebooklm_allow_oauth_mismatch ?? true,
+      notebooklm_auto_switch_on_slide_failure:
+        settings.notebooklm_auto_switch_on_slide_failure ?? true,
       chat_mode_personas: normalizeChatModePersonas(settings.chat_mode_personas)
     });
     setStatusText(null);
@@ -239,6 +314,18 @@ export const SettingsModal = memo(function SettingsModal({
     setOpenAiApiToken("");
     setGoogleClientIdInput("");
     setGoogleClientSecretInput("");
+    setGoogleDriveInputFolderId(
+      String(connectionStatus?.google_workspace.drive_mapping?.input_folder_id ?? "").trim()
+    );
+    setGoogleDriveOutputFolderId(
+      String(connectionStatus?.google_workspace.drive_mapping?.output_folder_id ?? "").trim()
+    );
+    setServiceAccountProjectId(
+      String(connectionStatus?.google_workspace.service_account?.project_id ?? "").trim()
+    );
+    setServiceAccountClientEmail(
+      String(connectionStatus?.google_workspace.service_account?.client_email ?? "").trim()
+    );
     setActiveChatMode("balanced");
     try {
       const raw = localStorage.getItem(`agentgcs_saved_keys_${userId}`);
@@ -250,7 +337,7 @@ export const SettingsModal = memo(function SettingsModal({
     } catch {
       setLocalSavedKeyNames([]);
     }
-  }, [open, settings, userId]);
+  }, [connectionStatus, open, settings, userId]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -445,6 +532,9 @@ export const SettingsModal = memo(function SettingsModal({
 
   const addTaskPersona = useCallback(() => {
     setDraftSettings((current) => {
+      if (current.personas.length >= MAX_TASK_PERSONAS) {
+        return current;
+      }
       const newPersona: PersonaProfile = {
         id: crypto.randomUUID(),
         name: `에이전트 ${current.personas.length + 1}`,
@@ -460,12 +550,16 @@ export const SettingsModal = memo(function SettingsModal({
 
   const removeTaskPersona = useCallback((personaId: string) => {
     setDraftSettings((current) => {
+      if (personaId === RESERVED_PERSONA_ID) return current;
       if (current.personas.length <= 1) return current;
       const filtered = current.personas.filter((persona) => persona.id !== personaId);
       return {
         ...current,
         personas: filtered,
-        active_persona_id: filtered[0]?.id ?? null
+        active_persona_id:
+          current.active_persona_id === personaId
+            ? (filtered[0]?.id ?? RESERVED_PERSONA_ID)
+            : current.active_persona_id
       };
     });
   }, []);
@@ -652,12 +746,71 @@ export const SettingsModal = memo(function SettingsModal({
     rememberSavedKey
   ]);
 
+  const saveGoogleDriveMapping = useCallback(async () => {
+    const inputId = googleDriveInputFolderId.trim();
+    const outputId = googleDriveOutputFolderId.trim();
+    const projectId = serviceAccountProjectId.trim();
+    const clientEmail = serviceAccountClientEmail.trim();
+    if (!inputId && !outputId && !projectId && !clientEmail) return;
+    setSavingKey(true);
+    setStatusText(null);
+    try {
+      if (inputId) {
+        await onSaveApiKey("google_drive_input_root_folder_id", inputId);
+        await onSaveApiKey("google_drive_input_folder_id", inputId);
+        rememberSavedKey("google_drive_input_root_folder_id");
+        rememberSavedKey("google_drive_input_folder_id");
+      }
+      if (outputId) {
+        await onSaveApiKey("google_drive_output_root_folder_id", outputId);
+        await onSaveApiKey("google_drive_output_folder_id", outputId);
+        rememberSavedKey("google_drive_output_root_folder_id");
+        rememberSavedKey("google_drive_output_folder_id");
+      }
+      if (projectId) {
+        await onSaveApiKey("google_service_account_project_id", projectId);
+        rememberSavedKey("google_service_account_project_id");
+      }
+      if (clientEmail) {
+        await onSaveApiKey("google_service_account_client_email", clientEmail);
+        rememberSavedKey("google_service_account_client_email");
+      }
+      setStatusText("Google Drive 기본 경로/계정 매핑이 저장되었습니다.");
+      await onRefreshConnectionStatus();
+    } catch (error) {
+      setStatusText((error as Error).message);
+    } finally {
+      setSavingKey(false);
+    }
+  }, [
+    googleDriveInputFolderId,
+    googleDriveOutputFolderId,
+    serviceAccountProjectId,
+    serviceAccountClientEmail,
+    onSaveApiKey,
+    rememberSavedKey,
+    onRefreshConnectionStatus
+  ]);
+
   const handleSaveSettings = useCallback(async () => {
     setSaving(true);
     setStatusText(null);
     try {
+      const normalizedPersonas = normalizeTaskPersonas(draftSettings.personas);
+      const activePersonaId =
+        normalizedPersonas.find((persona) => persona.id === draftSettings.active_persona_id)?.id ??
+        normalizedPersonas[0]?.id ??
+        RESERVED_PERSONA_ID;
       await onSaveSettings({
         ...draftSettings,
+        notebooklm_profile: draftSettings.notebooklm_profile?.trim() || null,
+        notebooklm_allow_oauth_mismatch: Boolean(draftSettings.notebooklm_allow_oauth_mismatch),
+        notebooklm_auto_switch_on_slide_failure: Boolean(
+          draftSettings.notebooklm_auto_switch_on_slide_failure
+        ),
+        personas: normalizedPersonas,
+        active_persona_id: activePersonaId,
+        discussion_rounds: normalizeDiscussionRounds(draftSettings.discussion_rounds),
         chat_mode_personas: normalizeChatModePersonas(draftSettings.chat_mode_personas)
       });
       setStatusText("설정이 저장되었습니다.");
@@ -681,8 +834,14 @@ export const SettingsModal = memo(function SettingsModal({
             <div>
               <h2 className="text-xl font-bold text-gray-800 dark:text-slate-100">계정 및 API 설정</h2>
               <p className="text-sm text-orange-900/70 dark:text-slate-300/80">
-                user_id: <span className="font-mono">{userId}</span>
-                {userEmail ? ` / ${userEmail}` : " / 이메일 미연결"}
+                {showDevDetails ? (
+                  <>
+                    user_id: <span className="font-mono">{userId}</span>
+                    {userEmail ? ` / ${userEmail}` : " / 이메일 미연결"}
+                  </>
+                ) : (
+                  <>{userEmail ? userEmail : "이메일 미연결"}</>
+                )}
               </p>
             </div>
             <Button type="button" variant="secondary" onClick={onClose} className="gap-1.5">
@@ -705,35 +864,8 @@ export const SettingsModal = memo(function SettingsModal({
               <Card className="space-y-3">
                 <CardTitle>API 연결</CardTitle>
                 <CardDescription>
-                  `api.1000.school` 토큰은 Claude 연결 토큰으로도 함께 사용됩니다.
+                  일반 대화는 ChatGPT, 고급 작업/토론은 Claude(실패 시 ChatGPT 폴백)로 자동 라우팅됩니다.
                 </CardDescription>
-                <div className="rounded-xl border border-white/70 bg-white/45 p-2 dark:border-slate-700 dark:bg-slate-800/60">
-                  <p className="mb-1 text-xs font-semibold text-gray-800 dark:text-slate-100">
-                    AI 제공자 선택
-                  </p>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={selectedProvider === "claude" ? "accent" : "secondary"}
-                      onClick={() =>
-                        setDraftSettings((current) => ({ ...current, ai_provider: "claude" }))
-                      }
-                    >
-                      Claude
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={selectedProvider === "openai" ? "accent" : "secondary"}
-                      onClick={() =>
-                        setDraftSettings((current) => ({ ...current, ai_provider: "openai" }))
-                      }
-                    >
-                      ChatGPT
-                    </Button>
-                  </div>
-                </div>
                 <Input
                   value={schoolApiToken}
                   onChange={(event) => setSchoolApiToken(event.target.value)}
@@ -815,16 +947,18 @@ export const SettingsModal = memo(function SettingsModal({
                       connectionStatus?.school_api.token_saved ? "오류" : "미연결"
                     )}
                   </div>
-                  {connectionStatus?.school_api.reason ? (
-                    <p className="text-xs text-red-800 dark:text-red-300">
-                      사유: {connectionStatus.school_api.reason}
-                    </p>
-                  ) : (
-                    <p className="text-xs text-orange-900/75 dark:text-slate-300/80">
-                      상태: {connectionStatus?.school_api.status ?? "unknown"} / source:{" "}
-                      {connectionStatus?.school_api.source ?? "none"}
-                    </p>
-                  )}
+                  {showDevDetails ? (
+                    connectionStatus?.school_api.reason ? (
+                      <p className="text-xs text-red-800 dark:text-red-300">
+                        사유: {connectionStatus.school_api.reason}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-orange-900/75 dark:text-slate-300/80">
+                        상태: {connectionStatus?.school_api.status ?? "unknown"} / source:{" "}
+                        {connectionStatus?.school_api.source ?? "none"}
+                      </p>
+                    )
+                  ) : null}
                 </div>
 
                 <div className="rounded-xl border border-white/70 bg-white/50 p-3 dark:border-slate-700 dark:bg-slate-800/60">
@@ -841,10 +975,15 @@ export const SettingsModal = memo(function SettingsModal({
                     상태: {connectionStatus?.google_workspace.status ?? "unknown"}
                     {connectionStatus?.google_workspace.token_expired ? " / access token 만료" : ""}
                     {connectionStatus?.google_workspace.refresh_available ? " / refresh token 보유" : ""}
-                    {connectionStatus?.google_workspace.reason
+                    {showDevDetails && connectionStatus?.google_workspace.reason
                       ? ` / reason: ${connectionStatus.google_workspace.reason}`
                       : ""}
                   </p>
+                  {connectionStatus?.google_workspace.connected_account?.email && (
+                    <p className="mb-2 text-xs text-orange-900/75 dark:text-slate-300/80">
+                      연결 계정: {connectionStatus.google_workspace.connected_account.email}
+                    </p>
+                  )}
                   <Button
                     type="button"
                     variant="secondary"
@@ -856,8 +995,119 @@ export const SettingsModal = memo(function SettingsModal({
                       ? "Google OAuth 연결 중..."
                       : hasGoogleToken
                         ? "Google OAuth 재연결"
-                        : "Google OAuth 연결"}
+                      : "Google OAuth 연결"}
                   </Button>
+                  <div className="mt-3 space-y-2 rounded-xl border border-white/70 bg-white/55 p-3 dark:border-slate-700 dark:bg-slate-900/40">
+                    <p className="text-xs font-semibold text-gray-800 dark:text-slate-100">
+                      NotebookLM 계정 전환
+                    </p>
+                    <Input
+                      value={draftSettings.notebooklm_profile ?? ""}
+                      onChange={(event) =>
+                        setDraftSettings((current) => ({
+                          ...current,
+                          notebooklm_profile: event.target.value || null
+                        }))
+                      }
+                      placeholder="NotebookLM 프로필명 또는 이메일 (예: personal / user@domain.com)"
+                    />
+                    <label className="flex items-center justify-between rounded-xl border border-white/70 bg-white/50 px-3 py-2 text-xs text-orange-900/85 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-200">
+                      <span>OAuth와 NotebookLM 계정 다름 허용</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(draftSettings.notebooklm_allow_oauth_mismatch)}
+                        onChange={(event) =>
+                          setDraftSettings((current) => ({
+                            ...current,
+                            notebooklm_allow_oauth_mismatch: event.target.checked
+                          }))
+                        }
+                        className="h-4 w-4 accent-orange-500"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between rounded-xl border border-white/70 bg-white/50 px-3 py-2 text-xs text-orange-900/85 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-200">
+                      <span>슬라이드 실패 시 다른 NotebookLM 프로필 자동 전환</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(draftSettings.notebooklm_auto_switch_on_slide_failure)}
+                        onChange={(event) =>
+                          setDraftSettings((current) => ({
+                            ...current,
+                            notebooklm_auto_switch_on_slide_failure: event.target.checked
+                          }))
+                        }
+                        className="h-4 w-4 accent-orange-500"
+                      />
+                    </label>
+                    <p className="text-[11px] text-orange-900/75 dark:text-slate-300/80">
+                      비워두면 OAuth 연결 계정을 우선 사용합니다. 슬라이드 한도/권한 오류 시 저장된 프로필을 순회해
+                      가능한 계정으로 자동 전환합니다.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-white/70 bg-white/50 p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-sm font-semibold text-gray-800 dark:text-slate-100">
+                      Google Drive 기본 경로 매핑
+                    </p>
+                    {statusChip(
+                      Boolean(connectionStatus?.google_workspace.drive_mapping?.configured),
+                      "정상 작동중",
+                      "부분 설정"
+                    )}
+                  </div>
+                  <div className="space-y-2">
+                    <Input
+                      value={googleDriveInputFolderId}
+                      onChange={(event) => setGoogleDriveInputFolderId(event.target.value)}
+                      placeholder="Input Folder ID (예: 1eflSS...)"
+                    />
+                    <Input
+                      value={googleDriveOutputFolderId}
+                      onChange={(event) => setGoogleDriveOutputFolderId(event.target.value)}
+                      placeholder="Output Folder ID (예: 19u-3v...)"
+                    />
+                    <Input
+                      value={serviceAccountProjectId}
+                      onChange={(event) => setServiceAccountProjectId(event.target.value)}
+                      placeholder="Service Account Project ID (옵션)"
+                    />
+                    <Input
+                      value={serviceAccountClientEmail}
+                      onChange={(event) => setServiceAccountClientEmail(event.target.value)}
+                      placeholder="Service Account Client Email (옵션)"
+                    />
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      disabled={
+                        savingKey ||
+                        (!googleDriveInputFolderId.trim() &&
+                          !googleDriveOutputFolderId.trim() &&
+                          !serviceAccountProjectId.trim() &&
+                          !serviceAccountClientEmail.trim())
+                      }
+                      onClick={() => void saveGoogleDriveMapping()}
+                    >
+                      Drive 매핑 저장
+                    </Button>
+                    {statusChip(
+                      Boolean(connectionStatus?.google_workspace.drive_mapping?.input_configured),
+                      "Input 설정됨",
+                      "Input 미설정"
+                    )}
+                    {statusChip(
+                      Boolean(connectionStatus?.google_workspace.drive_mapping?.output_configured),
+                      "Output 설정됨",
+                      "Output 미설정"
+                    )}
+                  </div>
+                  <p className="mt-2 text-xs text-orange-900/75 dark:text-slate-300/80">
+                    과제 자동화는 여기 저장된 Drive Input/Output 폴더 ID를 우선 사용합니다.
+                  </p>
                 </div>
 
                 <div className="rounded-xl border border-white/70 bg-white/50 p-3 dark:border-slate-700 dark:bg-slate-800/60">
@@ -879,10 +1129,16 @@ export const SettingsModal = memo(function SettingsModal({
                     {dbConnecting ? "DB 로그인 처리 중..." : "DB 로그인"}
                   </Button>
                   <p className="mt-2 text-xs text-orange-900/70 dark:text-slate-300/80">
-                    source: {connectionStatus?.database?.source ?? "unknown"}
-                    {connectionStatus?.database?.reason
-                      ? ` / reason: ${connectionStatus.database.reason}`
-                      : ""}
+                    {showDevDetails ? (
+                      <>
+                        source: {connectionStatus?.database?.source ?? "unknown"}
+                        {connectionStatus?.database?.reason
+                          ? ` / reason: ${connectionStatus.database.reason}`
+                          : ""}
+                      </>
+                    ) : (
+                      <>상세 진단은 Dev 모드에서 확인할 수 있습니다.</>
+                    )}
                   </p>
                 </div>
 
@@ -913,7 +1169,7 @@ export const SettingsModal = memo(function SettingsModal({
                 </div>
 
                 <div className="rounded-xl border border-white/70 bg-white/50 p-3 text-xs text-orange-900/80 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
-                  저장된 키: {keyNames.length > 0 ? keyNames.join(", ") : "없음"}
+                  상태 표시: 연결 뱃지가 `정상 작동중`이면 저장/연결이 정상입니다.
                 </div>
               </Card>
 
@@ -989,13 +1245,22 @@ export const SettingsModal = memo(function SettingsModal({
                 )}
               </Card>
 
-              <Card className="space-y-3">
-                <CardTitle>과제 해결용 멀티 에이전트 페르소나</CardTitle>
-                <CardDescription>
-                  과제 자동화에서만 사용하는 에이전트 페르소나입니다. 사용자 성향과는 분리됩니다.
-                </CardDescription>
-                <div className="flex items-center justify-end">
-                  <Button type="button" variant="secondary" className="gap-1.5" onClick={addTaskPersona}>
+                <Card className="space-y-3">
+                  <CardTitle>과제 해결용 멀티 에이전트 페르소나</CardTitle>
+                  <CardDescription>
+                  과제 자동화에서만 사용하는 에이전트 페르소나입니다. 최소 3개, 최대 6개까지 사용됩니다.
+                  </CardDescription>
+                <div className="flex items-center justify-between">
+                  <p className="text-xs text-orange-900/75 dark:text-slate-300/80">
+                    현재 {draftSettings.personas.length}/{MAX_TASK_PERSONAS}개
+                  </p>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="gap-1.5"
+                    onClick={addTaskPersona}
+                    disabled={draftSettings.personas.length >= MAX_TASK_PERSONAS}
+                  >
                     <Plus className="h-4 w-4" />
                     에이전트 추가
                   </Button>
@@ -1018,7 +1283,10 @@ export const SettingsModal = memo(function SettingsModal({
                         }
                       >
                         <p className="text-sm font-semibold text-gray-800 dark:text-slate-100">{persona.name}</p>
-                        <p className="text-xs text-orange-900/65 dark:text-slate-300/80">{persona.id}</p>
+                        <p className="text-xs text-orange-900/65 dark:text-slate-300/80">
+                          {persona.id}
+                          {persona.id === RESERVED_PERSONA_ID ? " (system)" : ""}
+                        </p>
                       </button>
                       <div className="mt-2 flex items-center gap-2">
                         <Input
@@ -1032,13 +1300,35 @@ export const SettingsModal = memo(function SettingsModal({
                           size="sm"
                           variant="secondary"
                           onClick={() => removeTaskPersona(persona.id)}
-                          disabled={draftSettings.personas.length <= 1}
+                          disabled={
+                            draftSettings.personas.length <= 1 || persona.id === RESERVED_PERSONA_ID
+                          }
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </Button>
                       </div>
                     </div>
                   ))}
+                </div>
+                <div className="rounded-xl border border-white/70 bg-white/50 p-3 dark:border-slate-700 dark:bg-slate-800/60">
+                  <p className="mb-2 text-sm font-semibold text-gray-800 dark:text-slate-100">
+                    토론 라운드 수 (2~5)
+                  </p>
+                  <select
+                    value={String(normalizeDiscussionRounds(draftSettings.discussion_rounds))}
+                    onChange={(event) =>
+                      setDraftSettings((current) => ({
+                        ...current,
+                        discussion_rounds: normalizeDiscussionRounds(event.target.value)
+                      }))
+                    }
+                    className="h-10 w-full rounded-xl border border-white/80 bg-white/70 px-3 text-sm text-gray-800 outline-none focus:border-orange-300 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-100"
+                  >
+                    <option value="2">2 라운드</option>
+                    <option value="3">3 라운드</option>
+                    <option value="4">4 라운드</option>
+                    <option value="5">5 라운드</option>
+                  </select>
                 </div>
               </Card>
 
@@ -1166,7 +1456,7 @@ export const SettingsModal = memo(function SettingsModal({
                       />
                     </div>
                     <p className="text-xs text-orange-900/70 dark:text-slate-300/80">
-                      메인 AI 제공자는 상단 스위치에서 고르고, 여기서 Claude/GPT 각각의 기본 모델을 지정합니다.
+                      작업 난이도에 따라 백엔드가 자동 라우팅하며, 여기서는 Claude/ChatGPT 기본 모델만 지정합니다.
                     </p>
                   </div>
                 )}

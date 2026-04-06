@@ -24,16 +24,34 @@ class Orchestrator:
         use_mock: bool = True,
     ) -> dict:
         run_id = str(uuid4())
+        count = max(3, min(6, persona_count))
+        personas = [
+            {
+                "id": "default-balanced",
+                "name": "기본 균형형",
+                "stats": PersonaStats().model_dump(),
+            }
+        ]
+        for idx in range(2, count + 1):
+            personas.append(
+                {
+                    "id": f"auto-persona-{idx}",
+                    "name": f"Auto Persona {idx}",
+                    "stats": PersonaStats().model_dump(),
+                }
+            )
         request = DeepTaskRequest(
             task=task,
             persona_stats=PersonaStats(),
-            worker_count=max(3, min(6, persona_count)),
+            worker_count=count,
+            trigger_source="console",
             use_mock=use_mock,
         )
         result = await self._orchestrator.run(
             user_id=user_id,
             run_id=run_id,
             request=request,
+            user_settings={"personas": personas, "discussion_rounds": 3},
         )
         return {
             "run_id": run_id,
@@ -42,4 +60,3 @@ class Orchestrator:
             "arguments": result.get("arguments", {}),
             "artifacts": result.get("artifacts", {}),
         }
-

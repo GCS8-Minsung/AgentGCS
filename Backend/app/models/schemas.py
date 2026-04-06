@@ -47,6 +47,7 @@ class DeepTaskRequest(BaseModel):
     task: str = Field(min_length=3, max_length=500)
     persona_stats: PersonaStats
     worker_count: int = Field(default=5, ge=3, le=6)
+    trigger_source: Literal["console", "chat"] = "console"
     notify_email: EmailStr | None = None
     use_mock: bool = True
 
@@ -158,6 +159,10 @@ class UserSettingsPayload(BaseModel):
     chat_mode_personas: dict[str, PersonaStats] = Field(default_factory=dict)
     active_persona_id: str | None = None
     personas: list[PersonaProfile] = Field(default_factory=list)
+    discussion_rounds: int = Field(default=3, ge=2, le=5)
+    notebooklm_profile: str | None = Field(default=None, max_length=120)
+    notebooklm_allow_oauth_mismatch: bool = True
+    notebooklm_auto_switch_on_slide_failure: bool = True
     approval_policy: ApprovalPolicy = Field(default_factory=ApprovalPolicy)
 
 

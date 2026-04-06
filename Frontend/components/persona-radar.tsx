@@ -37,7 +37,7 @@ function PersonaRadarComponent({
 }: Props) {
   const center = size / 2;
   const baseRadius = size * 0.31;
-  const safeRadius = Math.max(26, baseRadius - HANDLE_RADIUS - 3);
+  const interactionRadius = Math.max(24, baseRadius - HANDLE_HALO_RADIUS - 2);
   const svgRef = useRef<SVGSVGElement>(null);
   const valueRef = useRef<PersonaStats>(value);
   const moveRef = useRef<{ x: number; y: number } | null>(null);
@@ -68,11 +68,11 @@ function PersonaRadarComponent({
       PERSONA_AXES.map((axis, index) => {
         const ratio = normalizedValue[axis.key] / 100;
         return {
-          x: center + axisVectors[index].x * safeRadius * ratio,
-          y: center + axisVectors[index].y * safeRadius * ratio
+          x: center + axisVectors[index].x * interactionRadius * ratio,
+          y: center + axisVectors[index].y * interactionRadius * ratio
         };
       }),
-    [axisVectors, center, normalizedValue, safeRadius]
+    [axisVectors, center, normalizedValue, interactionRadius]
   );
 
   const updateAxisByPointer = useCallback(
@@ -86,14 +86,14 @@ function PersonaRadarComponent({
       const dy = y - center;
 
       const unit = axisVectors[axisIndex];
-      const projected = (dx * unit.x + dy * unit.y) / safeRadius;
+      const projected = (dx * unit.x + dy * unit.y) / interactionRadius;
       const nextValue = Math.round(Math.max(0, Math.min(1, projected)) * 100);
       const targetAxis = PERSONA_AXES[axisIndex];
       const currentValue = valueRef.current[targetAxis.key];
       if (currentValue === nextValue) return;
       onChange({ ...valueRef.current, [targetAxis.key]: nextValue });
     },
-    [axisVectors, center, onChange, safeRadius, size]
+    [axisVectors, center, onChange, interactionRadius, size]
   );
 
   useEffect(() => {
@@ -144,7 +144,7 @@ function PersonaRadarComponent({
             data={data}
             cx="50%"
             cy="50%"
-            outerRadius={safeRadius}
+            outerRadius={interactionRadius}
             startAngle={90}
             endAngle={-270}
           >

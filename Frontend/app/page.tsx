@@ -31,6 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   agentChat,
   bootstrapUser,
+  cancelDeepTask,
   createConversation,
   deleteConversation,
   fetchConnectionStatus,
@@ -116,6 +117,10 @@ const DEFAULT_SETTINGS: UserSettings = {
       stats: DEFAULT_STATS
     }
   ],
+  discussion_rounds: 3,
+  notebooklm_profile: null,
+  notebooklm_allow_oauth_mismatch: true,
+  notebooklm_auto_switch_on_slide_failure: true,
   approval_policy: {
     cautious_requires_approval: true,
     balanced_requires_approval: true,
@@ -138,6 +143,11 @@ type ConsoleMessage = {
   content: string;
   role: "user" | "assistant";
   timestamp: Date;
+};
+
+type TransientStatus = {
+  key: "intent" | "stream_start" | "stream_done";
+  text: string;
 };
 
 type WorkspaceView = "multi_agent" | "kanban" | "automation";
@@ -176,11 +186,69 @@ function summarizeEvent(event: AgentEvent): string | null {
   if (event.event_type === "deep_task.debate_turn") {
     return `[${String(payload.persona_label ?? "Agent")}] ${String(payload.message ?? "")}`;
   }
+  if (event.event_type === "deep_task.started") {
+    return String(payload.message ?? "멀티 에이전트 토론을 시작합니다.");
+  }
+  if (event.event_type === "deep_task.discovery") {
+    return `근거 수집 완료 (Drive ${String(payload.drive_file_count ?? "0")} / 일반 ${String(payload.general_count ?? "0")} / 학술 ${String(payload.academic_count ?? "0")})`;
+  }
+  if (event.event_type === "deep_task.round_started") {
+    return `토론 라운드 시작: ${String(payload.round ?? "?")}/${String(payload.total_rounds ?? "?")}`;
+  }
+  if (event.event_type === "deep_task.account_verified") {
+    const status = String(payload.status ?? "unknown");
+    const email = String(payload.email ?? "");
+    return `계정 검증: ${status}${email ? ` (${email})` : ""}`;
+  }
+  if (event.event_type === "deep_task.input_folder_checked") {
+    const status = String(payload.status ?? "unknown");
+    const folder = String(payload.folder_name ?? "input");
+    const count = String(payload.file_count ?? "0");
+    return `Drive input 폴더 확인: ${folder} / ${count}개 파일 (${status})`;
+  }
+  if (event.event_type === "deep_task.web_enrichment_completed") {
+    return `웹 보강 검색 완료 (일반 ${String(payload.general_count ?? "0")} / 학술 ${String(payload.academic_count ?? "0")})`;
+  }
+  if (event.event_type === "deep_task.search_query_built") {
+    return `검색 질의 생성: ${String(payload.query ?? "")}`;
+  }
+  if (event.event_type === "deep_task.round_completed") {
+    return `라운드 완료 (${String(payload.round ?? "?")}): ${String(payload.summary ?? "")}`;
+  }
+  if (event.event_type === "deep_task.stagnation_detected") {
+    return `토론 정체 감지: ${String(payload.round ?? "?")}R / 연속 ${String(payload.streak ?? "?")}회`;
+  }
+  if (event.event_type === "deep_task.decision_by_default_balanced") {
+    return String(payload.message ?? "default-balanced가 최종 결정을 수행합니다.");
+  }
+  if (event.event_type === "deep_task.artifacts_ready") {
+    const folderUrl = String(payload.folder_url ?? "");
+    const brief = String(payload.brief ?? "");
+    if (folderUrl) {
+      return `산출물 업로드 완료\n- Drive: ${folderUrl}\n- 요약: ${brief}`;
+    }
+    return `산출물 준비 완료\n${brief}`;
+  }
+  if (event.event_type === "deep_task.post_processing") {
+    return String(payload.message ?? "후처리를 진행 중입니다.");
+  }
+  if (event.event_type === "deep_task.moderator_decision") {
+    return `최종 결론 확정\n${String(payload.summary ?? "")}`;
+  }
+  if (event.event_type === "chat.deep_task_candidate") {
+    return "심층 과제가 감지되었습니다. 확인 후 멀티 에이전트 토론을 시작할 수 있습니다.";
+  }
   if (event.event_type === "deep_task.completed") {
     return `최종 결론\n${String(payload.final_summary ?? "")}`;
   }
   if (event.event_type === "deep_task.failed") {
     return `실행 실패\n${String(payload.message ?? payload.description ?? "원인 미상")}`;
+  }
+  if (event.event_type === "deep_task.cancel_requested") {
+    return String(payload.message ?? "중단 요청을 접수했습니다.");
+  }
+  if (event.event_type === "deep_task.cancelled") {
+    return String(payload.message ?? "작업이 중단되었습니다.");
   }
   if (event.event_type === "toast.notification" && typeof payload.description === "string") {
     return payload.description;
@@ -189,16 +257,16 @@ function summarizeEvent(event: AgentEvent): string | null {
     return null;
   }
   if (event.event_type === "chat.intent.classified") {
-    return `의도 분류: ${String(payload.intent ?? "unknown")} (${String(payload.confidence ?? "-")})`;
+    return null;
   }
   if (event.event_type === "chat.stream.started") {
-    return "응답 스트리밍을 시작합니다.";
+    return null;
   }
   if (event.event_type === "chat.stream.delta") {
     return null;
   }
   if (event.event_type === "chat.stream.completed") {
-    return "응답 스트리밍이 완료되었습니다.";
+    return null;
   }
   if (event.event_type === "pipeline.planner.started") {
     return "계획 수립을 시작합니다.";
@@ -217,6 +285,26 @@ function summarizeEvent(event: AgentEvent): string | null {
   }
   if (event.event_type === "pipeline.failed") {
     return `파이프라인 실패: ${String(payload.code ?? "unknown")} / ${String(payload.message ?? "")}`;
+  }
+  return null;
+}
+
+function toTransientStatus(event: AgentEvent): TransientStatus | null {
+  const payload =
+    event.payload && typeof event.payload === "object"
+      ? (event.payload as Record<string, unknown>)
+      : {};
+  if (event.event_type === "chat.intent.classified") {
+    return {
+      key: "intent",
+      text: `의도 분류 중: ${String(payload.intent ?? "unknown")} (${String(payload.confidence ?? "-")})`
+    };
+  }
+  if (event.event_type === "chat.stream.started") {
+    return { key: "stream_start", text: "응답 스트리밍 시작..." };
+  }
+  if (event.event_type === "chat.stream.completed") {
+    return { key: "stream_done", text: "응답 스트리밍 완료..." };
   }
   return null;
 }
@@ -273,12 +361,13 @@ export default function HomePage() {
   const [personalInstruction, setPersonalInstruction] = useState("");
   const [loadingWorkspace, setLoadingWorkspace] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [transientStatuses, setTransientStatuses] = useState<TransientStatus[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const apiKeysRef = useRef<ApiKeyMeta[]>([]);
-  const devModeRef = useRef<boolean>(settings.dev_mode);
-  const providerRef = useRef<"claude" | "openai">(settings.ai_provider);
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const stoppingRef = useRef(false);
 
   const activeTaskPersona = useMemo(() => {
     const target = settings.personas.find((persona) => persona.id === settings.active_persona_id);
@@ -296,30 +385,19 @@ export default function HomePage() {
   );
   const hasSchoolApiToken = useMemo(
     () =>
-      settings.dev_mode ||
       Boolean(connectionStatus?.school_api.token_saved) ||
       apiKeys.some((item) => item.key_name === "school_api_token"),
-    [apiKeys, connectionStatus?.school_api.token_saved, settings.dev_mode]
+    [apiKeys, connectionStatus?.school_api.token_saved]
   );
   const hasOpenAiToken = useMemo(
     () =>
-      settings.dev_mode ||
       Boolean(connectionStatus?.openai_fallback?.reachable) ||
       Boolean(connectionStatus?.openai_fallback?.token_saved) ||
       apiKeys.some((item) => item.key_name === "openai_api_key"),
-    [
-      apiKeys,
-      connectionStatus?.openai_fallback?.reachable,
-      connectionStatus?.openai_fallback?.token_saved,
-      settings.dev_mode
-    ]
+    [apiKeys, connectionStatus?.openai_fallback?.reachable, connectionStatus?.openai_fallback?.token_saved]
   );
-  const hasAiChatToken = useMemo(
-    () => (settings.ai_provider === "openai" ? hasOpenAiToken : hasSchoolApiToken),
-    [hasOpenAiToken, hasSchoolApiToken, settings.ai_provider]
-  );
+  const hasAiChatToken = useMemo(() => hasOpenAiToken || hasSchoolApiToken, [hasOpenAiToken, hasSchoolApiToken]);
   const connectionRows = useMemo(() => {
-    const provider = settings.ai_provider;
     const claudeLevel: HealthLevel = connectionStatus?.claude.reachable ? "ok" : "error";
     const openAiLevel: HealthLevel = connectionStatus?.openai_fallback?.reachable
       ? "ok"
@@ -336,35 +414,32 @@ export default function HomePage() {
       : connectionStatus?.google_workspace.token_saved
         ? "warn"
         : "error";
-    const dbLevel: HealthLevel = connectionStatus?.database?.connected
-      ? "ok"
-      : settings.dev_mode
-        ? "warn"
-        : "error";
+    const dbLevel: HealthLevel = connectionStatus?.database?.connected ? "ok" : "error";
 
     return [
       {
-        key: "ai",
-        label: provider === "openai" ? "ChatGPT (OpenAI)" : "Claude",
-        status:
-          provider === "openai"
-            ? connectionStatus?.openai_fallback?.reachable
-              ? `정상 작동중 (${connectionStatus?.openai_fallback?.model ?? "gpt"})`
-              : hasOpenAiToken
-                ? `부분 오류 (${connectionStatus?.openai_fallback?.status ?? "diagnostics_unavailable"})`
-                : "미연결"
-            : connectionStatus?.claude.reachable
-              ? "정상 작동중"
-              : `오류 (${connectionStatus?.claude.status ?? "unknown"})`,
-        detail:
-          provider === "openai"
-            ? connectionStatus?.openai_fallback?.reachable
-              ? null
-              : "OpenAI API 키 저장 및 권한/쿼터를 점검해주세요."
-            : connectionStatus?.claude.reachable
-              ? null
-              : "Base URL, API 토큰, 게이트웨이 상태를 점검해주세요.",
-        level: provider === "openai" ? openAiLevel : claudeLevel
+        key: "openai",
+        label: "ChatGPT (일반 대화)",
+        status: connectionStatus?.openai_fallback?.reachable
+          ? `정상 작동중 (${connectionStatus?.openai_fallback?.model ?? "gpt"})`
+          : hasOpenAiToken
+            ? `부분 오류 (${connectionStatus?.openai_fallback?.status ?? "diagnostics_unavailable"})`
+            : "미연결",
+        detail: connectionStatus?.openai_fallback?.reachable
+          ? null
+          : "OpenAI API 키 저장 및 권한/쿼터를 점검해주세요.",
+        level: openAiLevel
+      },
+      {
+        key: "claude",
+        label: "Claude (고연산/토론)",
+        status: connectionStatus?.claude.reachable
+          ? "정상 작동중"
+          : `오류 (${connectionStatus?.claude.status ?? "unknown"})`,
+        detail: connectionStatus?.claude.reachable
+          ? null
+          : "Base URL, API 토큰, 게이트웨이 상태를 점검해주세요.",
+        level: claudeLevel
       },
       {
         key: "school",
@@ -395,14 +470,14 @@ export default function HomePage() {
       {
         key: "database",
         label: "Database",
-        status: connectionStatus?.database?.connected
-          ? `연결됨 (${connectionStatus.database.source})`
-          : `연결 오류 (${connectionStatus?.database?.source ?? "unknown"})`,
-        detail: connectionStatus?.database?.reason ?? null,
+        status: connectionStatus?.database?.connected ? "연결됨" : "연결 오류",
+        detail: connectionStatus?.database?.connected
+          ? `source=${connectionStatus?.database?.source ?? "unknown"}`
+          : connectionStatus?.database?.reason ?? `source=${connectionStatus?.database?.source ?? "unknown"}`,
         level: dbLevel
       }
     ] as const;
-  }, [connectionStatus, hasOpenAiToken, settings.ai_provider, settings.dev_mode]);
+  }, [connectionStatus, hasOpenAiToken]);
 
   const userId = session?.userId ?? "";
   const userEmail = session?.email ?? null;
@@ -410,13 +485,6 @@ export default function HomePage() {
   useEffect(() => {
     apiKeysRef.current = apiKeys;
   }, [apiKeys]);
-
-  useEffect(() => {
-    devModeRef.current = settings.dev_mode;
-  }, [settings.dev_mode]);
-  useEffect(() => {
-    providerRef.current = settings.ai_provider;
-  }, [settings.ai_provider]);
 
   const renderedMessages = useMemo(
     () =>
@@ -493,28 +561,17 @@ export default function HomePage() {
     const localHasOpenAiToken = apiKeysRef.current.some(
       (item) => item.key_name === "openai_api_key"
     );
-    const devModeEnabled = devModeRef.current;
-    const provider = providerRef.current;
     try {
       const response = await fetchConnectionStatus(userId);
       setConnectionStatus(response);
-      if (provider === "openai") {
-        const openAiReady = Boolean(
-          response.openai_fallback?.token_saved || response.openai_fallback?.reachable
-        );
-        setForceKeySetup(!openAiReady && !localHasOpenAiToken && !devModeEnabled);
-      } else {
-        setForceKeySetup(
-          !response.school_api.token_saved && !localHasSchoolToken && !devModeEnabled
-        );
-      }
+      const openAiReady = Boolean(
+        response.openai_fallback?.token_saved || response.openai_fallback?.reachable
+      );
+      const claudeReady = Boolean(response.school_api.token_saved || response.claude.reachable);
+      setForceKeySetup(!openAiReady && !claudeReady && !localHasOpenAiToken && !localHasSchoolToken);
     } catch {
       setConnectionStatus(null);
-      setForceKeySetup(
-        provider === "openai"
-          ? !localHasOpenAiToken && !devModeEnabled
-          : !localHasSchoolToken && !devModeEnabled
-      );
+      setForceKeySetup(!localHasOpenAiToken && !localHasSchoolToken);
     }
   }, [userId]);
 
@@ -582,14 +639,10 @@ export default function HomePage() {
   const startNewWorkflow = useCallback(async () => {
     if (!userId) return;
     try {
-      const created = await createConversation(userId, {
-        title: `새 워크플로우 (${new Date().toLocaleTimeString("ko-KR", {
-          hour: "2-digit",
-          minute: "2-digit"
-        })})`
-      });
+      const created = await createConversation(userId, {});
       setMessages([]);
       setEvents([]);
+      setTransientStatuses([]);
       setTask("");
       setPersonalInstruction("");
       setRunning(false);
@@ -597,7 +650,7 @@ export default function HomePage() {
       setActiveConversationId(created.item.id);
       await refreshConversations(created.item.id);
     } catch (error) {
-      appendAssistantMessage(`새 워크플로우 생성 실패: ${(error as Error).message}`);
+      appendAssistantMessage(`새 대화 생성 실패: ${(error as Error).message}`);
     }
   }, [appendAssistantMessage, refreshConversations, userId]);
 
@@ -639,6 +692,10 @@ export default function HomePage() {
         const nextSettings: UserSettings = {
           ...DEFAULT_SETTINGS,
           ...(settingsResponse.settings ?? DEFAULT_SETTINGS),
+          discussion_rounds: Math.max(
+            2,
+            Math.min(5, Number(settingsResponse.settings?.discussion_rounds ?? DEFAULT_SETTINGS.discussion_rounds))
+          ),
           chat_mode_personas: {
             ...DEFAULT_SETTINGS.chat_mode_personas,
             ...(settingsResponse.settings?.chat_mode_personas ?? {})
@@ -671,16 +728,12 @@ export default function HomePage() {
         setConversations(mappedConversations);
         let nextThreadId: string | null = null;
         try {
-          const created = await createConversation(sessionUserId, {
-            title: `새 워크플로우 (${new Date().toLocaleTimeString("ko-KR", {
-              hour: "2-digit",
-              minute: "2-digit"
-            })})`
-          });
+          const created = await createConversation(sessionUserId, {});
           nextThreadId = created.item.id;
           if (!cancelled) {
             setActiveConversationId(created.item.id);
             setMessages([]);
+            setTransientStatuses([]);
           }
           const latestConversations = await fetchConversations(sessionUserId, 20);
           if (!cancelled) {
@@ -715,7 +768,10 @@ export default function HomePage() {
         const hasSchoolKey = (keysResponse.items ?? []).some(
           (item) => item.key_name === "school_api_token"
         );
-        setForceKeySetup(!hasSchoolKey && !nextSettings.dev_mode);
+        const hasOpenAiKey = (keysResponse.items ?? []).some(
+          (item) => item.key_name === "openai_api_key"
+        );
+        setForceKeySetup(!hasSchoolKey && !hasOpenAiKey);
       } catch (error) {
         if (!cancelled) {
           setWorkspaceError((error as Error).message);
@@ -777,6 +833,13 @@ export default function HomePage() {
           const parsed = JSON.parse(message.data) as AgentEvent;
           if (!parsed.event_type) return;
           appendEvent(parsed);
+          const transient = toTransientStatus(parsed);
+          if (transient) {
+            setTransientStatuses((current) => {
+              const next = current.filter((item) => item.key !== transient.key);
+              return [...next, transient];
+            });
+          }
           const summary = summarizeEvent(parsed);
           if (summary && parsed.event_type !== "socket.connected") {
             appendAssistantMessage(summary);
@@ -784,10 +847,20 @@ export default function HomePage() {
           if (
             parsed.event_type === "deep_task.completed" ||
             parsed.event_type === "deep_task.failed" ||
+            parsed.event_type === "deep_task.cancelled" ||
             parsed.event_type === "pipeline.synthesizer.completed" ||
-            parsed.event_type === "pipeline.failed"
+            parsed.event_type === "pipeline.failed" ||
+            parsed.event_type === "chat.message_generated"
           ) {
             setRunning(false);
+            setTransientStatuses([]);
+            if (
+              parsed.event_type === "deep_task.completed" ||
+              parsed.event_type === "deep_task.failed" ||
+              parsed.event_type === "deep_task.cancelled"
+            ) {
+              setActiveRunId(null);
+            }
           }
         } catch {
           // ignore non-json heartbeat payloads
@@ -836,19 +909,13 @@ export default function HomePage() {
   }, [settings.theme]);
 
   useEffect(() => {
-    if (settings.dev_mode) {
-      setForceKeySetup(false);
-      return;
-    }
     if (
-      (settings.ai_provider === "openai" &&
-        apiKeys.some((item) => item.key_name === "openai_api_key")) ||
-      (settings.ai_provider === "claude" &&
-        apiKeys.some((item) => item.key_name === "school_api_token"))
+      apiKeys.some((item) => item.key_name === "openai_api_key") ||
+      apiKeys.some((item) => item.key_name === "school_api_token")
     ) {
       setForceKeySetup(false);
     }
-  }, [apiKeys, settings.ai_provider, settings.dev_mode]);
+  }, [apiKeys]);
 
   const maybeRequireApproval = useCallback(
     async (mode: AutonomyMode, riskyAction: boolean): Promise<boolean> => {
@@ -902,9 +969,7 @@ export default function HomePage() {
       if (!userId || !settings) return;
       if (!hasAiChatToken) {
         appendAssistantMessage(
-          settings.ai_provider === "openai"
-            ? "API 키를 입력하세요. 설정에서 OpenAI 예비용 API 키를 저장하면 대화를 시작할 수 있습니다."
-            : "API 키를 입력하세요. `api.1000.school` 토큰 저장 후 대화를 시작할 수 있습니다."
+          "API 키를 입력하세요. OpenAI API 키 또는 `api.1000.school` 토큰 중 하나를 저장하면 대화를 시작할 수 있습니다."
         );
         setSettingsOpen(true);
         return;
@@ -914,6 +979,7 @@ export default function HomePage() {
 
       setActiveView("multi_agent");
       setChatLoading(true);
+      setTransientStatuses([]);
       setMessages((current) => {
         const next = [
           ...current,
@@ -929,20 +995,24 @@ export default function HomePage() {
       });
 
       try {
+        const controller = new AbortController();
+        chatAbortRef.current = controller;
         const response = await agentChat({
           userId,
           message: text,
           threadId: activeConversationId,
-          title: text.slice(0, 30),
+          title: null,
           mode,
-          aiProvider: settings.ai_provider,
+          aiProvider: undefined,
           claudeModel: settings.preferred_model ?? null,
           openaiModel: settings.openai_preferred_model ?? null,
           personaStats: settings.chat_mode_personas[mode] ?? DEFAULT_STATS,
           knowledgePrompt: settings.knowledge_base_prompt ?? null,
-          useMock: settings.dev_mode,
-          debugRaw: settings.debug_raw_mode
+          useMock: false,
+          debugRaw: settings.debug_raw_mode,
+          signal: controller.signal
         });
+        chatAbortRef.current = null;
 
         setMessages((current) => {
           const next = [
@@ -959,22 +1029,72 @@ export default function HomePage() {
           if (next.length <= MAX_MESSAGES) return next;
           return next.slice(next.length - MAX_MESSAGES);
         });
+        setTransientStatuses([]);
 
         setActiveConversationId(response.thread_id);
         await refreshConversations(response.thread_id);
+
+        if (response.deep_task_candidate) {
+          const candidate = response.deep_task_candidate;
+          if (!hasSchoolApiToken) {
+            appendAssistantMessage(
+              "심층 과제 실행에는 Claude 연결 토큰이 필요합니다. 설정에서 `api.1000.school` 토큰을 저장해주세요."
+            );
+            setSettingsOpen(true);
+            return;
+          }
+          if (settings.personas.length < 3 || !candidate.can_start) {
+            appendAssistantMessage("과제 자동화를 시작하려면 멀티 에이전트 페르소나를 최소 3개 이상 설정해야 합니다.");
+            setSettingsOpen(true);
+            return;
+          }
+
+          const deepApproved = await maybeRequireApproval("balanced", true);
+          if (!deepApproved) {
+            appendAssistantMessage("심층 과제 실행 승인이 취소되었습니다.");
+            return;
+          }
+
+          appendAssistantMessage("심층 과제 트리거를 감지해 멀티 에이전트 토론을 자동 시작합니다.");
+          setRunning(true);
+          setActiveView("multi_agent");
+          const notifyCandidate = userEmail ?? undefined;
+          const notifyEmail = isValidEmail(notifyCandidate) ? notifyCandidate : undefined;
+          const deepTaskResponse = await startDeepTask({
+            userId,
+            task: candidate.task || text,
+            personaStats: activeTaskPersona?.stats ?? DEFAULT_STATS,
+            workerCount: Math.max(3, Math.min(6, candidate.worker_count || settings.personas.length)),
+            triggerSource: "chat",
+            notifyEmail,
+            useMock: false
+          });
+          setActiveRunId(deepTaskResponse.run_id ?? null);
+        }
       } catch (error) {
-        appendAssistantMessage(`요청 실패: ${(error as Error).message}`);
+        setTransientStatuses([]);
+        const message = (error as Error).message;
+        if (message.includes("요청이 중단되었습니다")) {
+          appendAssistantMessage("요청을 중단했습니다.");
+        } else {
+          appendAssistantMessage(`요청 실패: ${message}`);
+        }
       } finally {
+        chatAbortRef.current = null;
         setChatLoading(false);
+        setTransientStatuses([]);
       }
     },
     [
       activeConversationId,
       appendAssistantMessage,
       hasAiChatToken,
+      hasSchoolApiToken,
       maybeRequireApproval,
       refreshConversations,
       settings,
+      activeTaskPersona,
+      userEmail,
       userId
     ]
   );
@@ -993,6 +1113,28 @@ export default function HomePage() {
     [handleChatSend]
   );
 
+  const handleStopRunning = useCallback(async () => {
+    if (stoppingRef.current) return;
+    stoppingRef.current = true;
+    try {
+      if (chatAbortRef.current) {
+        chatAbortRef.current.abort();
+        chatAbortRef.current = null;
+      }
+      if (running && activeRunId && userId) {
+        await cancelDeepTask({ userId, runId: activeRunId });
+      }
+      setChatLoading(false);
+      setRunning(false);
+      setTransientStatuses([]);
+      appendAssistantMessage("중단 요청을 보냈습니다.");
+    } catch (error) {
+      appendAssistantMessage(`중단 요청 실패: ${(error as Error).message}`);
+    } finally {
+      stoppingRef.current = false;
+    }
+  }, [activeRunId, appendAssistantMessage, running, userId]);
+
   const handleSaveSettings = useCallback(async (nextSettings: UserSettings) => {
     if (!userId) return;
     const normalized: UserSettings = {
@@ -1002,6 +1144,12 @@ export default function HomePage() {
       preferred_model: nextSettings.preferred_model?.trim() || null,
       openai_preferred_model: nextSettings.openai_preferred_model?.trim() || "gpt-5-mini",
       knowledge_base_prompt: nextSettings.knowledge_base_prompt?.trim() || null,
+      discussion_rounds: Math.max(2, Math.min(5, Number(nextSettings.discussion_rounds ?? 3))),
+      notebooklm_profile: nextSettings.notebooklm_profile?.trim() || null,
+      notebooklm_allow_oauth_mismatch: Boolean(nextSettings.notebooklm_allow_oauth_mismatch),
+      notebooklm_auto_switch_on_slide_failure: Boolean(
+        nextSettings.notebooklm_auto_switch_on_slide_failure
+      ),
       chat_mode_personas: {
         ...DEFAULT_SETTINGS.chat_mode_personas,
         ...nextSettings.chat_mode_personas
@@ -1069,8 +1217,9 @@ export default function HomePage() {
         task: trimmedTask,
         personaStats: activeTaskPersona?.stats ?? DEFAULT_STATS,
         workerCount: Math.max(3, Math.min(6, settings.personas.length)),
+        triggerSource: "console",
         notifyEmail,
-        useMock: settings.dev_mode
+        useMock: false
       });
       setActiveRunId(response.run_id ?? null);
     } catch (error) {
@@ -1090,7 +1239,7 @@ export default function HomePage() {
       appendAssistantMessage("업무 자동화 요청을 먼저 입력해주세요.");
       return;
     }
-    if (!hasSchoolApiToken && !settings.dev_mode) {
+    if (!hasSchoolApiToken) {
       appendAssistantMessage("API 키를 입력하세요. `api.1000.school` 토큰 저장 후 업무 자동화를 실행할 수 있습니다.");
       setSettingsOpen(true);
       return;
@@ -1263,16 +1412,28 @@ export default function HomePage() {
 
                     <ChatInput
                       onSend={handleChatInputSend}
+                      onStop={() => void handleStopRunning()}
+                      isRunning={chatLoading || running}
                       isCenter={messages.length === 0}
                       disabled={chatLoading || loadingWorkspace || !hasAiChatToken}
                     />
+                    {transientStatuses.length > 0 && (
+                      <div className="mt-3 w-full max-w-4xl space-y-2 px-4">
+                        {transientStatuses.map((status) => (
+                          <p
+                            key={status.key}
+                            className="rounded-xl border border-gray-300 bg-gray-100/80 px-3 py-2 text-xs text-gray-600 dark:border-slate-600 dark:bg-slate-800/70 dark:text-slate-300"
+                          >
+                            {status.text}
+                          </p>
+                        ))}
+                      </div>
+                    )}
                   </>
                 )}
                 {!hasAiChatToken && (
                   <p className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/85">
-                    {settings.ai_provider === "openai"
-                      ? "API 키를 입력하세요. 설정에서 OpenAI API 키를 저장하면 AI 대화 입력창이 활성화됩니다."
-                      : "API 키를 입력하세요. 설정에서 `api.1000.school` 토큰을 저장하면 AI 대화 입력창이 활성화됩니다."}
+                    API 키를 입력하세요. OpenAI API 키 또는 `api.1000.school` 토큰을 저장하면 AI 대화를 사용할 수 있습니다.
                   </p>
                 )}
               </div>
@@ -1282,53 +1443,15 @@ export default function HomePage() {
               <Card className="space-y-3">
                 <CardTitle>사용자 인증 / 연결 현황</CardTitle>
                 <CardDescription>
-                  로그인: {session.provider === "google" ? "Google OAuth" : "Dev 모드"} / user_id:{" "}
-                  <span className="font-mono text-[11px]">{session.userId}</span>
+                  로그인: {session.provider === "google" ? "Google OAuth" : "Dev 모드"}
+                  {settings.dev_mode ? (
+                    <>
+                      {" "}
+                      / user_id: <span className="font-mono text-[11px]">{session.userId}</span>
+                    </>
+                  ) : null}
                 </CardDescription>
                 <div className="space-y-2">
-                  <div className="rounded-xl border border-white/70 bg-white/45 p-2 dark:border-slate-700 dark:bg-slate-800/60">
-                    <p className="mb-1 text-[11px] font-semibold text-orange-900/80 dark:text-slate-200">
-                      AI 제공자 전환
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Button
-                        size="sm"
-                        variant={settings.ai_provider === "claude" ? "accent" : "secondary"}
-                        onClick={async () => {
-                          const next = { ...settings, ai_provider: "claude" as const };
-                          setSettings(next);
-                          if (userId) {
-                            try {
-                              await saveWorkspaceSettings(userId, next);
-                              await refreshConnectionStatus();
-                            } catch {
-                              // ignore
-                            }
-                          }
-                        }}
-                      >
-                        Claude
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant={settings.ai_provider === "openai" ? "accent" : "secondary"}
-                        onClick={async () => {
-                          const next = { ...settings, ai_provider: "openai" as const };
-                          setSettings(next);
-                          if (userId) {
-                            try {
-                              await saveWorkspaceSettings(userId, next);
-                              await refreshConnectionStatus();
-                            } catch {
-                              // ignore
-                            }
-                          }
-                        }}
-                      >
-                        ChatGPT
-                      </Button>
-                    </div>
-                  </div>
                   {connectionRows.map((row) => {
                     const theme = resolveHealthLevelClass(row.level);
                     return (
@@ -1343,7 +1466,7 @@ export default function HomePage() {
                           <div className="min-w-0 flex-1">
                             <p className="font-semibold">{row.label}</p>
                             <p className="mt-0.5">{row.status}</p>
-                            {row.detail ? (
+                            {settings.dev_mode && row.detail ? (
                               <p className="mt-1 text-[10px] opacity-85">{row.detail}</p>
                             ) : null}
                           </div>
@@ -1352,11 +1475,9 @@ export default function HomePage() {
                     );
                   })}
                 </div>
-                {forceKeySetup && !settings.dev_mode && (
+                {forceKeySetup && (
                   <p className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900/80">
-                    {settings.ai_provider === "openai"
-                      ? "OpenAI API 키를 먼저 저장해주세요."
-                      : "`api.1000.school` 토큰을 먼저 저장해주세요."}
+                    OpenAI API 키 또는 `api.1000.school` 토큰을 하나 이상 저장해주세요.
                   </p>
                 )}
               </Card>
@@ -1443,7 +1564,7 @@ export default function HomePage() {
                     입력 비우기
                   </Button>
                 </div>
-                {activeRunId && (
+                {settings.dev_mode && activeRunId && (
                   <p className="rounded-xl bg-white/70 px-3 py-2 font-mono text-xs text-orange-900/80">
                     run_id: {activeRunId}
                   </p>
@@ -1476,14 +1597,17 @@ export default function HomePage() {
                 </Button>
               </Card>
 
-              <PerfTrace id="generative-feed" thresholdMs={8}>
-                <GenerativeFeed events={events} running={running} />
-              </PerfTrace>
+              {settings.dev_mode && (
+                <PerfTrace id="generative-feed" thresholdMs={8}>
+                  <GenerativeFeed events={events} running={running} />
+                </PerfTrace>
+              )}
 
               <Card className="space-y-3">
                 <CardTitle>워크플로우 상태</CardTitle>
                 <CardDescription>
-                  정보 탐색 → 5인 토론 → 결론 → NotebookLM 후처리 → Drive/Gmail 통보
+                  정보 탐색 → {Math.max(3, Math.min(6, settings.personas.length))}인 × {settings.discussion_rounds}
+                  라운드 토론 → 결론 → NotebookLM 후처리 → Drive/Gmail 통보
                 </CardDescription>
                 <div className="grid grid-cols-3 gap-2 text-xs text-orange-900/80">
                   <div className="rounded-xl border border-white/80 bg-white/55 p-3 dark:bg-slate-800/70">

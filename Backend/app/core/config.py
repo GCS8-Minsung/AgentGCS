@@ -13,6 +13,14 @@ class Settings(BaseSettings):
     app_name: str = "AgentGCS Backend"
     api_prefix: str = "/api"
     backend_cors_origins: str = Field(default="http://localhost:3000")
+    backend_cors_origin_regex: str | None = (
+        r"^https?://("
+        r"localhost|127\.0\.0\.1|"
+        r"192\.168\.\d+\.\d+|"
+        r"10\.\d+\.\d+\.\d+|"
+        r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+"
+        r")(:\d+)?$"
+    )
 
     # Supabase
     supabase_url: str = ""
@@ -43,6 +51,12 @@ class Settings(BaseSettings):
     google_client_secret: str | None = None
     google_oauth_redirect_uri: str | None = None
     google_oauth_access_token: str | None = None
+    google_drive_output_root_name: str = "AgentGCS-output"
+    google_drive_input_root_name: str = "input"
+    google_drive_input_root_folder_id: str | None = None
+    google_drive_output_root_folder_id: str | None = None
+    google_service_account_project_id: str | None = None
+    google_service_account_client_email: str | None = None
 
     # Chat Context (Redis)
     redis_url: str | None = None

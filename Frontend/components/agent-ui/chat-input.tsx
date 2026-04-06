@@ -1,17 +1,25 @@
 "use client";
 
 import { useState } from "react";
-import { Paperclip, Scale, Send, ShieldCheck, Sparkles, Zap } from "lucide-react";
+import { Paperclip, Scale, Send, ShieldCheck, Sparkles, Square, Zap } from "lucide-react";
 
 import { AutonomyMode } from "@/lib/types";
 
 interface ChatInputProps {
   onSend: (message: string, autonomyMode: AutonomyMode) => void;
+  onStop?: () => void;
+  isRunning?: boolean;
   isCenter: boolean;
   disabled?: boolean;
 }
 
-export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps) {
+export function ChatInput({
+  onSend,
+  onStop,
+  isRunning = false,
+  isCenter,
+  disabled = false
+}: ChatInputProps) {
   const [message, setMessage] = useState("");
   const [autonomyMode, setAutonomyMode] = useState<AutonomyMode>("balanced");
 
@@ -82,6 +90,17 @@ export function ChatInput({ onSend, isCenter, disabled = false }: ChatInputProps
               }}
             />
           </button>
+          {isRunning && onStop && (
+            <button
+              type="button"
+              onClick={onStop}
+              className="flex items-center gap-1 rounded-2xl border border-red-200/80 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-100 dark:border-red-700/60 dark:bg-red-900/20 dark:text-red-200"
+              title="응답/후속 동작 중단"
+            >
+              <Square className="h-3.5 w-3.5" />
+              중단
+            </button>
+          )}
         </div>
 
         <div className="mt-3 flex justify-center">

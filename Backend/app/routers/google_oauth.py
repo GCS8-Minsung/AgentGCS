@@ -407,8 +407,10 @@ async def google_oauth_callback(
         "expires_in": expires_in,
         "expires_at": expires_at.isoformat(),
         "scope": scope,
+        "scopes": [item for item in scope.split(" ") if item],
         "token_type": token_data.get("token_type"),
         "source": "authorization_code",
+        "refresh_token_present": bool(refresh_token),
     }
 
     await _store_encrypted_key(user_id, "google_oauth_access_token", access_token)

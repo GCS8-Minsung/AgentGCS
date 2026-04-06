@@ -14,3 +14,5 @@ duckduckgo-search>=6.2.13,<8.0.0
 ddgs>=9.0.0,<11.0.0
 redis>=5.2.0,<6.0.0
 python-pptx>=1.0.2,<2.0.0
+pypdf>=5.4.0,<6.0.0
+notebooklm-mcp-cli>=0.5.16,<1.0.0

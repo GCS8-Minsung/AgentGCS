@@ -1,4 +1,5 @@
 from app.services.intent_classifier import (
+    INTENT_DEEP_TASK,
     INTENT_GENERAL_CHAT,
     INTENT_TOOL_REQUIRED,
     heuristic_intent,
@@ -43,3 +44,18 @@ def test_openapi_based_intent_for_meeting_room_reservation_create():
         action["path"] == "/meeting-rooms/{room_id}/reservations" and action["method"] == "POST"
         for action in decision.school_api_actions
     )
+
+
+def test_heuristic_deep_task_detected():
+    decision = heuristic_intent("멀티 에이전트로 종합 분석 보고서를 작성하고 단계별 실행 전략까지 정리해줘")
+    assert decision.intent == INTENT_DEEP_TASK
+
+
+def test_heuristic_deep_task_detected_with_drive_trigger_phrase():
+    decision = heuristic_intent("과제를 진행할께. 연결된 구글 드라이브를 참고해서 진행해줘")
+    assert decision.intent == INTENT_DEEP_TASK
+
+
+def test_heuristic_deep_task_detected_with_compact_drive_trigger_phrase():
+    decision = heuristic_intent("과제진행할께 연결된구글드라이브참고해서진행")
+    assert decision.intent == INTENT_DEEP_TASK

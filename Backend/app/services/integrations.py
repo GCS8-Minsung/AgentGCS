@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import mimetypes
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover
+    PdfReader = None
 
 from app.core.config import settings
 from app.core.security import EncryptedPayload
@@ -23,7 +28,9 @@ GOOGLE_API_BASE_URL = "https://www.googleapis.com"
 GOOGLE_TIMEOUT = 20.0
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
+GOOGLE_USERINFO_URL = "/oauth2/v2/userinfo"
 DEFAULT_GOOGLE_CLIENT_ID = "513803184584-7sb5sp4qv68a534kvd0u3inp0ruf021r.apps.googleusercontent.com"
+DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 _security_manager = SecurityManager(settings.encryption_master_key)
 
 
@@ -264,6 +271,550 @@ async def _google_request(
         )
 
 
+def _drive_folder_url(folder_id: str | None) -> str | None:
+    if not folder_id:
+        return None
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def _escape_drive_query_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+async def get_connected_google_oauth_identity(user_id: str) -> dict[str, Any]:
+    token, token_error = await _get_valid_google_access_token(user_id)
+    if not token:
+        return {
+            "status": "not_configured",
+            "error": token_error or "google_oauth_access_token missing",
+        }
+
+    try:
+        response = await _google_request(token, "GET", GOOGLE_USERINFO_URL)
+        if response.status_code >= 400:
+            return {
+                "status": "error",
+                "error": f"userinfo failed: {response.status_code} {response.text[:180]}",
+            }
+        payload = response.json() if response.text else {}
+        return {
+            "status": "live",
+            "email": str(payload.get("email") or "").strip() or None,
+            "name": str(payload.get("name") or "").strip() or None,
+            "sub": str(payload.get("id") or payload.get("sub") or "").strip() or None,
+            "verified_email": bool(payload.get("verified_email")),
+        }
+    except Exception as exc:
+        return {"status": "error", "error": f"userinfo exception: {str(exc)[:200]}"}
+
+
+async def _drive_find_folder(
+    *,
+    token: str,
+    name: str,
+    parent_id: str | None,
+) -> dict[str, Any] | None:
+    parent_condition = f"'{parent_id}' in parents" if parent_id else "'root' in parents"
+    query = (
+        f"mimeType='{DRIVE_FOLDER_MIME}' and trashed=false and "
+        f"name='{_escape_drive_query_value(name)}' and {parent_condition}"
+    )
+    response = await _google_request(
+        token,
+        "GET",
+        "/drive/v3/files",
+        params={
+            "q": query,
+            "fields": "files(id,name,mimeType,webViewLink)",
+            "pageSize": 5,
+            "orderBy": "createdTime desc",
+        },
+    )
+    if response.status_code >= 400:
+        return None
+    payload = response.json() if response.text else {}
+    rows = payload.get("files")
+    if isinstance(rows, list) and rows:
+        row = rows[0]
+        return row if isinstance(row, dict) else None
+    return None
+
+
+async def _drive_create_folder(
+    *,
+    token: str,
+    name: str,
+    parent_id: str | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "name": name,
+        "mimeType": DRIVE_FOLDER_MIME,
+    }
+    if parent_id:
+        metadata["parents"] = [parent_id]
+
+    response = await _google_request(
+        token,
+        "POST",
+        "/drive/v3/files",
+        params={"fields": "id,name,mimeType,webViewLink"},
+        json_body=metadata,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"drive folder create failed: {response.status_code} {response.text[:200]}")
+    payload = response.json() if response.text else {}
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise RuntimeError("drive folder create failed: empty id")
+    return payload
+
+
+async def _drive_get_folder_by_id(token: str, folder_id: str) -> dict[str, Any] | None:
+    response = await _google_request(
+        token,
+        "GET",
+        f"/drive/v3/files/{folder_id}",
+        params={"fields": "id,name,mimeType,trashed,webViewLink"},
+    )
+    if response.status_code >= 400:
+        return None
+    payload = response.json() if response.text else {}
+    return payload if isinstance(payload, dict) else None
+
+
+async def _drive_list_files_in_folder(
+    *,
+    token: str,
+    folder_id: str,
+    page_size: int = 20,
+) -> list[dict[str, Any]]:
+    query = (
+        f"trashed=false and mimeType!='{DRIVE_FOLDER_MIME}' and "
+        f"'{_escape_drive_query_value(folder_id)}' in parents"
+    )
+    response = await _google_request(
+        token,
+        "GET",
+        "/drive/v3/files",
+        params={
+            "q": query,
+            "fields": "files(id,name,mimeType,modifiedTime,size,webViewLink,webContentLink)",
+            "pageSize": max(1, min(page_size, 100)),
+            "orderBy": "modifiedTime desc",
+        },
+    )
+    if response.status_code >= 400:
+        return []
+    payload = response.json() if response.text else {}
+    rows = payload.get("files")
+    if isinstance(rows, list):
+        return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+async def _drive_read_text_content(
+    *,
+    token: str,
+    file_id: str,
+    mime_type: str,
+) -> tuple[str, str | None]:
+    def _extract_pdf_text(payload: bytes) -> str:
+        if not payload:
+            return ""
+        if PdfReader is None:
+            return ""
+        try:
+            reader = PdfReader(io.BytesIO(payload))
+            chunks: list[str] = []
+            max_pages = min(len(reader.pages), 40)
+            for idx in range(max_pages):
+                page = reader.pages[idx]
+                text = (page.extract_text() or "").strip()
+                if text:
+                    chunks.append(text)
+                if sum(len(item) for item in chunks) >= 50000:
+                    break
+            joined = "\n".join(chunks).strip()
+            return joined[:50000] if len(joined) > 50000 else joined
+        except Exception:
+            return ""
+
+    mt = (mime_type or "").strip()
+    export_mime: str | None = None
+    is_pdf = mt in {"application/pdf", "application/x-pdf"}
+    textual_media_types = (
+        mt.startswith("text/")
+        or mt in {"application/json", "application/xml", "application/csv", "application/x-yaml", "application/yaml"}
+    )
+    if mt == "application/vnd.google-apps.document":
+        export_mime = "text/plain"
+    elif mt == "application/vnd.google-apps.spreadsheet":
+        export_mime = "text/csv"
+    elif mt == "application/vnd.google-apps.presentation":
+        export_mime = "text/plain"
+
+    try:
+        if export_mime:
+            response = await _google_request(
+                token,
+                "GET",
+                f"/drive/v3/files/{file_id}/export",
+                params={"mimeType": export_mime},
+            )
+        else:
+            if not textual_media_types and not is_pdf:
+                return "", f"unsupported_mime:{mt or 'unknown'}"
+            response = await _google_request(
+                token,
+                "GET",
+                f"/drive/v3/files/{file_id}",
+                params={"alt": "media"},
+            )
+        if response.status_code >= 400:
+            return "", f"read_failed:{response.status_code}"
+        if not response.content:
+            return "", "empty_content"
+        if is_pdf:
+            extracted_pdf = _extract_pdf_text(response.content)
+            if extracted_pdf:
+                return extracted_pdf, None
+            return "", "pdf_text_not_found"
+        raw = response.text
+        normalized = str(raw or "").strip()
+        if normalized:
+            return normalized, None
+        return "", "empty_text"
+    except Exception:
+        return "", "read_exception"
+
+
+def _compact_text_for_summary(text: str, *, max_len: int = 1200) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max(0, max_len - 3)] + "..."
+
+
+async def collect_google_drive_input_summary(
+    *,
+    user_id: str,
+    max_files: int = 8,
+    max_chars_per_file: int = 1200,
+) -> dict[str, Any]:
+    token, token_error = await _get_valid_google_access_token(user_id)
+    if not token:
+        return {
+            "status": "not_configured",
+            "folder_id": None,
+            "folder_name": None,
+            "folder_url": None,
+            "files": [],
+            "summary_markdown": "",
+            "error": token_error or "google_oauth_access_token missing",
+        }
+
+    stored_input_id = _decrypt_row(
+        await _fetch_encrypted_key(user_id, "google_drive_input_root_folder_id"),
+        user_id,
+    ) or _decrypt_row(
+        await _fetch_encrypted_key(user_id, "google_drive_input_folder_id"),
+        user_id,
+    )
+    if not stored_input_id:
+        stored_input_id = (settings.google_drive_input_root_folder_id or "").strip() or None
+    folder: dict[str, Any] | None = None
+    if stored_input_id:
+        existing = await _drive_get_folder_by_id(token, stored_input_id)
+        if existing and existing.get("mimeType") == DRIVE_FOLDER_MIME and not bool(existing.get("trashed")):
+            folder = existing
+
+    input_names = [
+        (settings.google_drive_input_root_name or "input").strip() or "input",
+        "input",
+        "Input",
+        "AgentGCS-input",
+    ]
+    if folder is None:
+        seen: set[str] = set()
+        for name in input_names:
+            lowered = name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            found = await _drive_find_folder(token=token, name=name, parent_id=None)
+            if found:
+                folder = found
+                break
+
+    if folder is None:
+        return {
+            "status": "missing_folder",
+            "folder_id": None,
+            "folder_name": input_names[0],
+            "folder_url": None,
+            "files": [],
+            "summary_markdown": "",
+            "error": "google_drive_input_folder_not_found",
+        }
+
+    folder_id = str(folder.get("id") or "").strip()
+    folder_name = str(folder.get("name") or "").strip() or input_names[0]
+    if folder_id:
+        await _store_encrypted_key(user_id, "google_drive_input_root_folder_id", folder_id)
+        await _store_encrypted_key(user_id, "google_drive_input_folder_id", folder_id)
+
+    file_rows = await _drive_list_files_in_folder(token=token, folder_id=folder_id, page_size=max_files * 2)
+    if not file_rows:
+        return {
+            "status": "empty",
+            "folder_id": folder_id or None,
+            "folder_name": folder_name,
+            "folder_url": _drive_folder_url(folder_id or None),
+            "files": [],
+            "summary_markdown": "",
+            "error": "google_drive_input_folder_empty",
+        }
+
+    summarized_files: list[dict[str, Any]] = []
+    for row in file_rows[:max_files]:
+        file_id = str(row.get("id") or "").strip()
+        file_name = str(row.get("name") or "").strip() or "untitled"
+        mime_type = str(row.get("mimeType") or "").strip()
+        modified_time = str(row.get("modifiedTime") or "").strip() or None
+        view_link = str(row.get("webViewLink") or row.get("webContentLink") or "").strip() or None
+        extracted, extraction_error = await _drive_read_text_content(
+            token=token,
+            file_id=file_id,
+            mime_type=mime_type,
+        )
+        snippet = _compact_text_for_summary(extracted, max_len=max_chars_per_file)
+        summarized_files.append(
+            {
+                "file_id": file_id or None,
+                "name": file_name,
+                "mime_type": mime_type,
+                "modified_time": modified_time,
+                "drive_url": view_link,
+                "snippet": snippet,
+                "has_text": bool(snippet),
+                "extraction_error": extraction_error,
+            }
+        )
+
+    lines: list[str] = [
+        "# Google Drive Input Folder Summary",
+        "",
+        f"- Folder: {folder_name}",
+        f"- Folder URL: {_drive_folder_url(folder_id or None) or '-'}",
+        f"- File Count: {len(summarized_files)}",
+        "",
+        "## File Summaries",
+    ]
+    for idx, item in enumerate(summarized_files, start=1):
+        lines.append(f"- [D{idx}] {item['name']}")
+        lines.append(f"  - mime: {item['mime_type'] or '-'}")
+        if item.get("modified_time"):
+            lines.append(f"  - modified: {item['modified_time']}")
+        if item.get("drive_url"):
+            lines.append(f"  - url: {item['drive_url']}")
+        snippet = str(item.get("snippet") or "").strip()
+        if snippet:
+            lines.append(f"  - summary: {snippet}")
+        else:
+            extraction_error = str(item.get("extraction_error") or "").strip()
+            if extraction_error:
+                lines.append(f"  - summary: (텍스트 추출 불가: {extraction_error})")
+            else:
+                lines.append("  - summary: (텍스트 추출 불가)")
+    lines.append("")
+
+    return {
+        "status": "live",
+        "folder_id": folder_id or None,
+        "folder_name": folder_name,
+        "folder_url": _drive_folder_url(folder_id or None),
+        "files": summarized_files,
+        "summary_markdown": "\n".join(lines),
+        "error": None,
+    }
+
+
+async def _drive_ensure_output_root_folder(*, token: str, user_id: str) -> dict[str, Any]:
+    root_name = (settings.google_drive_output_root_name or "AgentGCS-output").strip() or "AgentGCS-output"
+    stored_root_id = _decrypt_row(
+        await _fetch_encrypted_key(user_id, "google_drive_output_root_folder_id"),
+        user_id,
+    ) or _decrypt_row(
+        await _fetch_encrypted_key(user_id, "google_drive_output_folder_id"),
+        user_id,
+    )
+    if not stored_root_id:
+        stored_root_id = (settings.google_drive_output_root_folder_id or "").strip() or None
+    if stored_root_id:
+        existing = await _drive_get_folder_by_id(token, stored_root_id)
+        if (
+            existing
+            and existing.get("mimeType") == DRIVE_FOLDER_MIME
+            and not bool(existing.get("trashed"))
+        ):
+            return existing
+
+    found = await _drive_find_folder(token=token, name=root_name, parent_id=None)
+    if found:
+        folder_id = str(found.get("id") or "")
+        if folder_id:
+            await _store_encrypted_key(user_id, "google_drive_output_root_folder_id", folder_id)
+            await _store_encrypted_key(user_id, "google_drive_output_folder_id", folder_id)
+        return found
+
+    created = await _drive_create_folder(token=token, name=root_name, parent_id=None)
+    folder_id = str(created.get("id") or "")
+    if folder_id:
+        await _store_encrypted_key(user_id, "google_drive_output_root_folder_id", folder_id)
+        await _store_encrypted_key(user_id, "google_drive_output_folder_id", folder_id)
+    return created
+
+
+async def _drive_ensure_run_folder(
+    *,
+    token: str,
+    output_root_folder_id: str,
+    run_id: str,
+) -> dict[str, Any]:
+    folder_name = run_id.strip()[:120] or "run"
+    found = await _drive_find_folder(token=token, name=folder_name, parent_id=output_root_folder_id)
+    if found:
+        return found
+    return await _drive_create_folder(token=token, name=folder_name, parent_id=output_root_folder_id)
+
+
+async def _drive_upload_file(
+    *,
+    token: str,
+    path: Path,
+    parent_id: str | None,
+) -> dict[str, Any]:
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    metadata: dict[str, Any] = {"name": path.name}
+    if parent_id:
+        metadata["parents"] = [parent_id]
+
+    file_bytes = path.read_bytes()
+    response = await _google_request(
+        token,
+        "POST",
+        "/upload/drive/v3/files",
+        params={"uploadType": "multipart", "fields": "id,name,webViewLink,webContentLink,mimeType"},
+        files={
+            "metadata": (
+                "metadata",
+                json.dumps(metadata, ensure_ascii=False),
+                "application/json; charset=UTF-8",
+            ),
+            "file": (path.name, file_bytes, mime_type),
+        },
+    )
+    if response.status_code >= 400:
+        return {
+            "status": "error",
+            "file_name": path.name,
+            "local_path": str(path),
+            "error": f"drive upload failed: {response.status_code} {response.text[:240]}",
+        }
+
+    payload = response.json() if response.text else {}
+    return {
+        "status": "live",
+        "file_name": payload.get("name", path.name) if isinstance(payload, dict) else path.name,
+        "local_path": str(path),
+        "file_id": payload.get("id") if isinstance(payload, dict) else None,
+        "mime_type": payload.get("mimeType", mime_type) if isinstance(payload, dict) else mime_type,
+        "drive_url": (
+            payload.get("webViewLink") or payload.get("webContentLink")
+            if isinstance(payload, dict)
+            else None
+        ),
+    }
+
+
+async def upload_artifacts_to_google_drive(
+    *,
+    user_id: str,
+    run_id: str,
+    file_paths: list[str],
+) -> dict[str, Any]:
+    token, token_error = await _get_valid_google_access_token(user_id)
+    if not token:
+        return {
+            "status": "not_configured",
+            "run_id": run_id,
+            "output_root_folder_id": None,
+            "run_folder_id": None,
+            "folder_url": None,
+            "files": [],
+            "error": token_error or "google_oauth_access_token missing",
+        }
+
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_path in file_paths:
+        normalized = str(raw_path or "").strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        path = Path(normalized)
+        if path.exists() and path.is_file():
+            unique_paths.append(path.resolve())
+
+    if not unique_paths:
+        return {
+            "status": "error",
+            "run_id": run_id,
+            "output_root_folder_id": None,
+            "run_folder_id": None,
+            "folder_url": None,
+            "files": [],
+            "error": "no_uploadable_files",
+        }
+
+    try:
+        output_root = await _drive_ensure_output_root_folder(token=token, user_id=user_id)
+        output_root_id = str(output_root.get("id") or "")
+        run_folder = await _drive_ensure_run_folder(
+            token=token,
+            output_root_folder_id=output_root_id,
+            run_id=run_id,
+        )
+        run_folder_id = str(run_folder.get("id") or "")
+
+        files: list[dict[str, Any]] = []
+        for path in unique_paths:
+            item = await _drive_upload_file(token=token, path=path, parent_id=run_folder_id)
+            files.append(item)
+
+        has_live_file = any(item.get("status") == "live" for item in files)
+        return {
+            "status": "live" if has_live_file else "error",
+            "run_id": run_id,
+            "output_root_folder_id": output_root_id or None,
+            "run_folder_id": run_folder_id or None,
+            "folder_url": _drive_folder_url(run_folder_id or None),
+            "files": files,
+            "error": None if has_live_file else "all_uploads_failed",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "run_id": run_id,
+            "output_root_folder_id": None,
+            "run_folder_id": None,
+            "folder_url": None,
+            "files": [],
+            "error": f"drive upload exception: {str(exc)[:240]}",
+        }
+
+
 async def upload_to_google_drive(*, file_path: str, user_id: str) -> dict[str, Any]:
     name = Path(file_path).name
     token, token_error = await _get_valid_google_access_token(user_id)
@@ -414,6 +965,7 @@ async def diagnose_google_workspace(user_id: str) -> dict[str, Any]:
             "status": "not_configured",
             "reason": "google_oauth_access_token/google_oauth_refresh_token not found",
             "oauth_configured": oauth_configured,
+            "connected_account": None,
             "services": {
                 "drive": {"status": "not_configured"},
                 "gmail": {"status": "not_configured"},
@@ -430,6 +982,7 @@ async def diagnose_google_workspace(user_id: str) -> dict[str, Any]:
             "status": "auth_invalid",
             "reason": token_error or "invalid_google_token",
             "oauth_configured": oauth_configured,
+            "connected_account": None,
             "services": {
                 "drive": {"status": "auth_invalid"},
                 "gmail": {"status": "auth_invalid"},
@@ -482,12 +1035,28 @@ async def diagnose_google_workspace(user_id: str) -> dict[str, Any]:
     else:
         overall_status = "error"
 
+    connected_account: dict[str, Any] | None = None
+    try:
+        userinfo_response = await _google_request(valid_token, "GET", GOOGLE_USERINFO_URL)
+        if userinfo_response.status_code < 400:
+            userinfo_payload = userinfo_response.json() if userinfo_response.text else {}
+            if isinstance(userinfo_payload, dict):
+                connected_account = {
+                    "email": str(userinfo_payload.get("email") or "").strip() or None,
+                    "name": str(userinfo_payload.get("name") or "").strip() or None,
+                    "sub": str(userinfo_payload.get("id") or userinfo_payload.get("sub") or "").strip() or None,
+                    "verified_email": bool(userinfo_payload.get("verified_email")),
+                }
+    except Exception:
+        connected_account = None
+
     return {
         "token_saved": True,
         "reachable": ok_count > 0,
         "status": overall_status,
         "reason": None if ok_count > 0 else "all_google_service_probes_failed",
         "oauth_configured": oauth_configured,
+        "connected_account": connected_account,
         "services": services,
         "refresh_available": bool(refresh_token),
         "token_expired": _token_expired(meta),

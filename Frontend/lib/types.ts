@@ -90,6 +90,10 @@ export type UserSettings = {
   chat_mode_personas: Record<AutonomyMode, PersonaStats>;
   active_persona_id: string | null;
   personas: PersonaProfile[];
+  discussion_rounds: number;
+  notebooklm_profile?: string | null;
+  notebooklm_allow_oauth_mismatch: boolean;
+  notebooklm_auto_switch_on_slide_failure: boolean;
   approval_policy: ApprovalPolicy;
 };
 
@@ -147,6 +151,24 @@ export type WorkspaceConnectionStatus = {
     oauth_configured?: boolean;
     token_expired?: boolean;
     refresh_available?: boolean;
+    connected_account?: {
+      email?: string | null;
+      name?: string | null;
+      sub?: string | null;
+      verified_email?: boolean;
+    };
+    drive_mapping?: {
+      input_folder_id?: string | null;
+      output_folder_id?: string | null;
+      configured?: boolean;
+      input_configured?: boolean;
+      output_configured?: boolean;
+    };
+    service_account?: {
+      project_id?: string | null;
+      client_email?: string | null;
+      configured?: boolean;
+    };
     services?: {
       drive?: { status?: string; http_status?: number; reason?: string };
       gmail?: { status?: string; http_status?: number; reason?: string };
@@ -160,7 +182,12 @@ export type WorkspaceConnectionStatus = {
     model?: string;
   };
   active_provider?: "claude" | "openai";
-  database: { connected: boolean; source: "supabase" | "dev_store"; reason?: string | null };
+  database: {
+    connected: boolean;
+    status?: "ok" | "error";
+    source: "supabase" | "dev_store";
+    reason?: string | null;
+  };
   web_search?: { reachable?: boolean; status?: string; result_count?: number; reason?: string };
   tools_catalog?: { builtin_count?: number; openapi_count?: number };
 };
